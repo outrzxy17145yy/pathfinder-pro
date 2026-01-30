@@ -1,49 +1,29 @@
-# 使用官方 Node.js 20 版本 (Debian Slim 基础，兼容性较好)
+# 使用 Node.js 20 的 Debian-slim 版本
+# 注意：不要用 alpine，因为代码中下载的 Xray/Nezha 等二进制文件通常依赖 glibc
 FROM node:20-slim
 
 # 设置工作目录
 WORKDIR /app
 
-# 安装 Playwright 和系统依赖
-# Playwright 需要 Chromium 运行所需的库
-# curl 和 unzip 用于代码动态下载 cloudflared 和 xray
-RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    unzip \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    && rm -rf /var/lib/apt/lists/*
+# 设置时区（可选，避免日志时间混乱）
+ENV TZ=Asia/Shanghai
 
-# 复制 package.json 并安装依赖
-COPY package.json package-lock.json* ./
+# 复制 package.json 和 package-lock.json
+COPY package*.json ./
+
+# 安装依赖
 RUN npm install
 
-# 复制源代码
-COPY index.js ./
+# 复制项目其余文件
+COPY . .
 
-# 安装 Playwright 的 Chromium 浏览器
-RUN npx playwright install --with-deps chromium
+# 创建一个数据目录（可选，用于持久化数据，但你的代码默认写在根目录，这里仅作演示）
+# 如果你想把数据持久化，通常直接挂载 /app 目录
 
-# 暴露端口
-# 4237 是主应用端口
-# 8080 是代理服务器端口
+# 声明端口
+# 4237: Web控制面板
+# 8080: 代理服务端口
 EXPOSE 4237 8080
 
-# 设置环境变量 (可选，代码里默认也有配置)
-ENV NODE_ENV=production
-
-# 启动应用
+# 启动命令
 CMD ["node", "index.js"]
