@@ -34,7 +34,6 @@
     "mineflayer-pathfinder": "latest",
     "multer": "^1.4.5-lts.1",
     "node-schedule": "^2.1.1",
-    "playwright": "1.40.0",
     "qs": "^6.11.2",
     "tmp": "^0.2.1",
     "unzipper": "^0.10.14",
