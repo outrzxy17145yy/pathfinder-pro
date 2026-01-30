@@ -1,35 +1,27 @@
-注意：不要用 alpine，因为代码中下载的 Xray/Nezha 等二进制文件通常依赖 glibc
+# 使用轻量级的 Alpine Linux 镜像
+FROM node:18-alpine
 
-FROM node:20-slim
+# 安装系统依赖：curl 和 unzip (代码中通过 execSync 调用了它们)
+RUN apk add --no-cache curl unzip bash
 
-设置工作目录
-
+# 设置工作目录
 WORKDIR /app
 
-设置时区（可选，避免日志时间混乱）
+# 复制 package.json 并安装依赖
+COPY package.json ./
+RUN npm install --production
 
-ENV TZ=Asia/Shanghai
+# 复制源代码
+COPY index.js ./
 
-复制 package.json 和 package-lock.json
+# 设置环境变量
+# 可选：如果需要修改默认端口，可以设置 SERVER_PORT
+# ENV SERVER_PORT=4237
 
-COPY package*.json ./
-
-安装依赖
-
-RUN npm install
-
-复制项目其余文件
-
-COPY . .
-
-创建一个数据目录（可选，用于持久化数据，但你的代码默认写在根目录，这里仅作演示）
-如果你想把数据持久化，通常直接挂载 /app 目录
-声明端口
-4237: Web控制面板
-8080: 代理服务端口
-
+# 暴露端口
+# 4237: Web 管理面板
+# 8080: 代理服务器 (Cloudflared Tunnel 入口)
 EXPOSE 4237 8080
 
-启动命令
-
+# 启动应用
 CMD ["node", "index.js"]
