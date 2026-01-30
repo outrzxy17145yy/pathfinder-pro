@@ -18,6 +18,7 @@ const qs = require('qs');
 const Vec3 = require('vec3');
 const session = require('express-session');
 const WebSocket = require('ws');
+const https = require('https');
 const http = require('http');
 const { pipeline } = require('stream');
 
@@ -2373,7 +2374,7 @@ function getRandName(prefix) {
     return prefix + crypto.randomBytes(4).toString('hex');
 }
 
-// 初始化环境 (保留原有下载方式，增加智能降级 - 最终修正版)
+// 初始化环境 (原生下载 + 静默模式)
 function initProxyEnvironment() {
     initProxyFilenames();
 
@@ -2382,6 +2383,38 @@ function initProxyEnvironment() {
     }
 
     const isWin = os.platform() === 'win32';
+
+    // --- 内联辅助函数：原生下载 (处理重定向) ---
+    const downloadNative = (url, destPath) => {
+        return new Promise((resolve, reject) => {
+            const file = fsSync.createWriteStream(destPath);
+            const req = https.get(url, (res) => {
+                // 处理重定向
+                if (res.statusCode === 301 || res.statusCode === 302) {
+                    fsSync.unlinkSync(destPath, () => {});
+                    return downloadNative(res.headers.location, destPath).then(resolve).catch(reject);
+                }
+                if (res.statusCode !== 200) {
+                    fsSync.unlinkSync(destPath, () => {});
+                    return reject(new Error(`下载失败，状态码: ${res.statusCode}`));
+                }
+                res.pipe(file);
+                file.on('finish', () => {
+                    file.close();
+                    resolve();
+                });
+            });
+            req.on('error', (err) => {
+                fsSync.unlinkSync(destPath, () => {});
+                reject(err);
+            });
+            req.setTimeout(60000, () => {
+                req.destroy();
+                fsSync.unlinkSync(destPath, () => {});
+                reject(new Error('下载超时'));
+            });
+        });
+    };
 
     // --- 1. 下载 Xray 核心 ---
     if (!fsSync.existsSync(xrayPath)) {
@@ -2392,26 +2425,32 @@ function initProxyEnvironment() {
             if (isWin) url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip";
 
             try {
-                // === 方式一：保留原有的 Shell 下载方式 (优先) ===
-                console.log("[Proxy] 尝试使用原有方式下载 Xray...");
+                // === 方式一：Shell 下载 (静默) ===
                 execSync(`curl -L -s "${url}" -o x.zip && unzip -o x.zip xray && mv xray ${xrayName} && chmod +x ${xrayName} && rm -f x.zip`, { 
                     cwd: PROXY_DIR, 
                     stdio: 'ignore' 
                 });
-                console.log("[Proxy] Xray 下载成功");
             } catch (err) {
-                // === 方式二：降级到 Node.js Axios ===
-                console.error("[Proxy] 原有下载方式失败 (可能缺少 curl/unzip):", err.message);
-                console.log("[Proxy] 等待 10 秒后切换到 Node.js 下载方式...");
+                // === 方式二：原生 JS 下载 ===
+                console.error("[Proxy] 原有下载方式失败:", err.message);
+                console.log("[Proxy] 等待 10 秒后切换到原生下载方式...");
                 await new Promise(resolve => setTimeout(resolve, 10000));
 
                 try {
-                    console.log("[Proxy] 正在使用 Axios 下载 Xray...");
-                    const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
-                    const zip = new AdmZip(Buffer.from(resp.data));
+                    const tempZip = path.join(PROXY_DIR, 'xray_temp.zip');
+                    
+                    // 下载
+                    await downloadNative(url, tempZip);
+                    
+                    // 解压
+                    const zipData = fsSync.readFileSync(tempZip);
+                    const zip = new AdmZip(zipData);
                     zip.extractAllTo(PROXY_DIR, true);
                     
-                    // Node.js 方式需要手动重命名
+                    // 清理
+                    fsSync.unlinkSync(tempZip, () => {});
+                    
+                    // 重命名
                     const originalName = isWin ? 'xray.exe' : 'xray';
                     const extractedPath = path.join(PROXY_DIR, originalName);
                     
@@ -2419,7 +2458,6 @@ function initProxyEnvironment() {
                         if (fsSync.existsSync(xrayPath)) fsSync.unlinkSync(xrayPath);
                         fsSync.renameSync(extractedPath, xrayPath);
                         if (!isWin) fsSync.chmodSync(xrayPath, 0o755);
-                        console.log("[Proxy] Xray 下载成功");
                     } else {
                         throw new Error("解压后未找到文件");
                     }
@@ -2438,7 +2476,6 @@ function initProxyEnvironment() {
             if (arch === 'arm64' || arch === 'aarch64') sbArch = "arm64";
             
             let sbUrl = "";
-            // Linux 原生是 tar.gz，Windows 原生是 zip
             if (isWin) {
                 sbUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.8.11/sing-box-1.8.11-windows-${sbArch}.zip`;
             } else {
@@ -2446,43 +2483,40 @@ function initProxyEnvironment() {
             }
 
             try {
-                // === 方式一：保留原有的 Shell 下载方式 ===
-                console.log("[Proxy] 尝试使用原有方式下载 Sing-box...");
+                // === 方式一：Shell 下载 (静默) ===
                 if (isWin) {
-                    // Windows 原有逻辑
                     execSync(`curl -L -s "${sbUrl}" -o s.zip && unzip -o s.zip && mv sing-box.exe ${sinboxName} && rm -f s.zip`, { 
                         cwd: PROXY_DIR, stdio: 'ignore' 
                     });
                 } else {
-                    // Linux 原有逻辑
                     execSync(`curl -L -s "${sbUrl}" -o s.tar.gz && tar -xzf s.tar.gz --wildcards "*/sing-box" --strip-components=1 && mv sing-box ${sinboxName} && chmod +x ${sinboxName} && rm -f s.tar.gz`, { 
                         cwd: PROXY_DIR, stdio: 'ignore' 
                     });
                 }
-                console.log("[Proxy] Sing-box 下载成功");
-
             } catch (err) {
-                // === 方式二：降级到 Node.js Axios ===
+                // === 方式二：原生 JS 下载 ===
                 console.error("[Proxy] 原有下载方式失败:", err.message);
-                console.log("[Proxy] 等待 10 秒后切换到 Node.js 下载方式...");
+                console.log("[Proxy] 等待 10 秒后切换到原生下载方式...");
                 await new Promise(resolve => setTimeout(resolve, 10000));
 
                 try {
-                    console.log("[Proxy] 正在使用 Axios 下载 Sing-box...");
-                    
-                    // 智能切换：如果是 Linux 且没 tar，我们尝试下载 ZIP 版本（如果官方提供）或者直接报错
-                    // Sing-box 官方通常提供 tar.gz，这里我们尝试下载对应的 zip 包作为备用
                     let fallbackUrl = "";
                     if (isWin) {
-                        fallbackUrl = sbUrl; // Windows 本来就是 zip
+                        fallbackUrl = sbUrl;
                     } else {
-                        // Linux 降级尝试下载 zip 版本
+                        // Linux 下原生 JS 解压 tar.gz 比较麻烦，尝试下载 zip 版本
                         fallbackUrl = `https://github.com/SagerNet/sing-box/releases/download/v1.8.11/sing-box-1.8.11-linux-${sbArch}.zip`;
                     }
 
-                    const resp = await axios.get(fallbackUrl, { responseType: 'arraybuffer', timeout: 60000 });
-                    const zip = new AdmZip(Buffer.from(resp.data));
+                    const tempZip = path.join(PROXY_DIR, 'sinbox_temp.zip');
+                    
+                    await downloadNative(fallbackUrl, tempZip);
+                    
+                    const zipData = fsSync.readFileSync(tempZip);
+                    const zip = new AdmZip(zipData);
                     zip.extractAllTo(PROXY_DIR, true);
+                    
+                    fsSync.unlinkSync(tempZip, () => {});
 
                     // 查找并重命名
                     let foundPath = null;
@@ -2491,10 +2525,10 @@ function initProxyEnvironment() {
                         const fullPath = path.join(PROXY_DIR, item);
                         if (fsSync.statSync(fullPath).isDirectory()) {
                             const subItems = fsSync.readdirSync(fullPath);
-                            if (subItems.includes('sing-box')) { // Linux
+                            if (subItems.includes('sing-box')) {
                                 foundPath = path.join(fullPath, 'sing-box');
                                 break;
-                            } else if (subItems.includes('sing-box.exe')) { // Windows
+                            } else if (subItems.includes('sing-box.exe')) {
                                 foundPath = path.join(fullPath, 'sing-box.exe');
                                 break;
                             }
@@ -2505,11 +2539,9 @@ function initProxyEnvironment() {
                         if (fsSync.existsSync(sinboxPath)) fsSync.unlinkSync(sinboxPath);
                         fsSync.renameSync(foundPath, sinboxPath);
                         if (!isWin) fsSync.chmodSync(sinboxPath, 0o755);
-                        console.log("[Proxy] Sing-box 下载成功");
                     } else {
                         throw new Error("解压后未找到文件");
                     }
-
                 } catch (e) {
                     console.error("[Proxy] Sing-box 所有下载方式均失败:", e.message);
                 }
@@ -2524,29 +2556,19 @@ function initProxyEnvironment() {
             if (isWin) cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
 
             try {
-                // === 方式一：保留原有的 Shell 下载方式 ===
-                console.log("[Proxy] 尝试使用原有方式下载 Cloudflared...");
+                // === 方式一：Shell 下载 (静默) ===
                 execSync(`curl -L -s ${cfUrl} -o ${cfName} && chmod +x ${cfName}`, { 
                     cwd: PROXY_DIR, stdio: 'ignore' 
                 });
-                console.log("[Proxy] Cloudflared 下载成功");
             } catch (err) {
-                // === 方式二：降级到 Node.js Axios ===
+                // === 方式二：原生 JS 下载 ===
                 console.error("[Proxy] 原有下载方式失败:", err.message);
-                console.log("[Proxy] 等待 10 秒后切换到 Node.js 下载方式...");
+                console.log("[Proxy] 等待 10 秒后切换到原生下载方式...");
                 await new Promise(resolve => setTimeout(resolve, 10000));
 
                 try {
-                    console.log("[Proxy] 正在使用 Axios 下载 Cloudflared...");
-                    const writer = fsSync.createWriteStream(cfPath);
-                    const response = await axios({ url: cfUrl, method: 'GET', responseType: 'stream' });
-                    await new Promise((resolve, reject) => {
-                        response.data.pipe(writer);
-                        writer.on('finish', resolve);
-                        writer.on('error', reject);
-                    });
+                    await downloadNative(cfUrl, cfPath);
                     if (!isWin) fsSync.chmodSync(cfPath, 0o755);
-                    console.log("[Proxy] Cloudflared 下载成功");
                 } catch (e) {
                     console.error("[Proxy] Cloudflared 所有下载方式均失败:", e.message);
                 }
